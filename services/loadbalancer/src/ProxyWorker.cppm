@@ -36,11 +36,25 @@ private:
     std::shared_ptr<DnsResolver> dns_resolver_;
     std::atomic<bool>& is_running_;
 
+    int max_connections_;        // hard cap: max_fds_ / 2 (2 fds per client+backend pair)
+    int active_connections_{0};  // live pairs tracked by this worker
+
     size_t round_robin_index_{0};
     std::vector<std::optional<Socket>> client_sockets_;
     std::vector<int> socket_partners_;
     std::vector<std::vector<char>> write_buffers_;
     std::vector<bool> is_pending_connect_;
+
+    // Set SO_LINGER{on=1, linger=0} so the next close() sends RST instead of FIN.
+    // Used on every rejection path so clients fail fast (ECONNRESET) rather than
+    // discovering capacity exhaustion only after a full TCP teardown.
+    static void reject_with_rst(int fd) noexcept {
+        linger sl{};
+        sl.l_onoff  = 1;
+        sl.l_linger = 0;
+        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+        // Caller's Socket RAII destructor calls close() -> RST dispatched by kernel
+    }
 
     void enqueue_write(int fd, const char* data, ssize_t len) noexcept {
         if (fd < 0 || fd >= max_fds_) return;
@@ -80,19 +94,35 @@ private:
             if (!client_opt) break;
 
             int client_fd = client_opt->get_fd();
-            if (client_fd >= max_fds_) continue;
+
+            // Circuit breaker: worker is at capacity — RST immediately so the client
+            // gets ECONNRESET and can retry another node without a slow FIN teardown.
+            if (active_connections_ >= max_connections_ || client_fd >= max_fds_) {
+                reject_with_rst(client_fd);
+                continue; // client_opt destructs -> close() -> RST
+            }
 
             // RCU load: lock-free snapshot of the current backend list
             auto table = dns_resolver_->get_routing_table();
-            if (!table || table->empty()) continue; // client_opt RAII closes fd
+            if (!table || table->empty()) {
+                reject_with_rst(client_fd);
+                continue;
+            }
 
             // Round-robin backend selection
             const sockaddr_in& dest = (*table)[round_robin_index_++ % table->size()];
 
             // Create a non-blocking outbound socket for the backend leg
             int backend_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-            if (backend_fd < 0) continue;
-            if (backend_fd >= max_fds_) { ::close(backend_fd); continue; }
+            if (backend_fd < 0) {
+                reject_with_rst(client_fd);
+                continue;
+            }
+            if (backend_fd >= max_fds_) {
+                ::close(backend_fd);
+                reject_with_rst(client_fd);
+                continue;
+            }
 
             // Mirror the client-side TCP_NODELAY: disable Nagle on the backend leg
             // to prevent up to 40ms coalescing delay on small Protobuf payloads
@@ -103,7 +133,11 @@ private:
             int ret = ::connect(backend_fd,
                                 reinterpret_cast<const sockaddr*>(&dest),
                                 sizeof(dest));
-            if (ret < 0 && errno != EINPROGRESS) { ::close(backend_fd); continue; }
+            if (ret < 0 && errno != EINPROGRESS) {
+                ::close(backend_fd);
+                reject_with_rst(client_fd);
+                continue;
+            }
 
             // Hand ownership to RAII socket wrapper
             client_sockets_[backend_fd] = Socket{FileDescriptor{backend_fd}};
@@ -113,6 +147,7 @@ private:
             if (!epoll_.add_socket(backend_fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP)) {
                 client_sockets_[backend_fd].reset();
                 is_pending_connect_[backend_fd] = false;
+                reject_with_rst(client_fd);
                 continue;
             }
 
@@ -121,12 +156,14 @@ private:
                 epoll_.remove_socket(backend_fd);
                 client_sockets_[backend_fd].reset();
                 is_pending_connect_[backend_fd] = false;
+                reject_with_rst(client_fd);
                 continue;
             }
 
             client_sockets_[client_fd] = std::move(*client_opt);
             socket_partners_[client_fd] = backend_fd;
             socket_partners_[backend_fd] = client_fd;
+            ++active_connections_;
         }
     }
 
@@ -139,6 +176,7 @@ private:
 
         int partner_fd = socket_partners_[fd];
         if (partner_fd != -1 && partner_fd < max_fds_) {
+            --active_connections_;
             epoll_.remove_socket(partner_fd);
             write_buffers_[partner_fd].clear();
             is_pending_connect_[partner_fd] = false;
@@ -163,6 +201,8 @@ public:
           dns_resolver_(std::move(dns)),
           is_running_(is_running)
     {
+        max_connections_ = max_fds_ / 2; // each pair consumes 2 fd slots
+
         client_sockets_.resize(max_fds_);
         socket_partners_.assign(max_fds_, -1);
         write_buffers_.resize(max_fds_);
