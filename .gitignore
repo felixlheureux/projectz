@@ -19,6 +19,7 @@ services/loadbalancer/loadbalancer
 
 # Compiled script binaries
 scripts/tcp_spammer
+scripts/tcp_sink
 
 # Scratch or temporary files
 test.cpp

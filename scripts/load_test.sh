@@ -25,6 +25,7 @@ PROXY_PORT="${2:-8080}"
 BACKEND_PORT="${3:-8081}"
 
 BIN="$SCRIPT_DIR/tcp_spammer"
+SINK_BIN="$SCRIPT_DIR/tcp_sink"
 PROXY_BIN="$LB_DIR/build/loadbalancer"
 
 PROXY_PID=""
@@ -56,39 +57,16 @@ echo "[1/4] Building proxy..."
 (cd "$LB_DIR" && make build -s)
 echo "      OK: $PROXY_BIN"
 
-echo "[2/4] Building tcp_spammer..."
+echo "[2/4] Building tcp_spammer and tcp_sink..."
 g++ -O3 -std=c++17 -pthread "$SCRIPT_DIR/tcp_spammer.cpp" -o "$BIN"
-echo "      OK: $BIN"
+g++ -O3 -std=c++17 -pthread "$SCRIPT_DIR/tcp_sink.cpp"    -o "$SINK_BIN"
+echo "      OK: $BIN, $SINK_BIN"
 
-# ── Step 2: Start a lightweight TCP backend ────────────────────────────────────
-# Accept-and-discard — suitable for CPS testing where connections close immediately.
+# ── Step 2: Start a compiled TCP backend ──────────────────────────────────────
+# tcp_sink uses the same edge-triggered epoll pattern as the proxy so it is
+# never the bottleneck — unlike a Python asyncio server.
 echo "[3/4] Starting backend on port $BACKEND_PORT..."
-python3 - "$BACKEND_PORT" <<'PYEOF' &
-import asyncio, sys
-
-async def handle(reader, writer):
-    try:
-        while True:
-            data = await reader.read(4096)
-            if not data:
-                break
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-async def main():
-    port = int(sys.argv[1])
-    server = await asyncio.start_server(handle, '127.0.0.1', port)
-    print(f"[backend] Listening on 127.0.0.1:{port}", flush=True)
-    async with server:
-        await server.serve_forever()
-
-asyncio.run(main())
-PYEOF
+"$SINK_BIN" "$BACKEND_PORT" &
 BACKEND_PID=$!
 
 # Wait for backend to be ready
