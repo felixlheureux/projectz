@@ -9,12 +9,15 @@ module;
 #include <cerrno>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <atomic>
 
 export module ProxyWorker;
 
 import Socket;
 import Epoll;
+import FileDescriptor;
 import DnsResolver;
 
 // A single-threaded event loop worker. Each worker owns its own listen socket
@@ -32,9 +35,11 @@ private:
     std::shared_ptr<DnsResolver> dns_resolver_;
     std::atomic<bool>& is_running_;
 
+    size_t round_robin_index_{0};
     std::vector<std::optional<Socket>> client_sockets_;
     std::vector<int> socket_partners_;
     std::vector<std::vector<char>> write_buffers_;
+    std::vector<bool> is_pending_connect_;
 
     void enqueue_write(int fd, const char* data, ssize_t len) noexcept {
         if (fd < 0 || fd >= max_fds_) return;
@@ -76,10 +81,46 @@ private:
             int client_fd = client_opt->get_fd();
             if (client_fd >= max_fds_) continue;
 
-            if (epoll_.add_socket(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP)) {
-                client_sockets_[client_fd] = std::move(*client_opt);
-                socket_partners_[client_fd] = -1;
+            // RCU load: lock-free snapshot of the current backend list
+            auto table = dns_resolver_->get_routing_table();
+            if (!table || table->empty()) continue; // client_opt RAII closes fd
+
+            // Round-robin backend selection
+            const sockaddr_in& dest = (*table)[round_robin_index_++ % table->size()];
+
+            // Create a non-blocking outbound socket for the backend leg
+            int backend_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (backend_fd < 0) continue;
+            if (backend_fd >= max_fds_) { ::close(backend_fd); continue; }
+
+            // Non-blocking connect: returns immediately with EINPROGRESS
+            int ret = ::connect(backend_fd,
+                                reinterpret_cast<const sockaddr*>(&dest),
+                                sizeof(dest));
+            if (ret < 0 && errno != EINPROGRESS) { ::close(backend_fd); continue; }
+
+            // Hand ownership to RAII socket wrapper
+            client_sockets_[backend_fd] = Socket{FileDescriptor{backend_fd}};
+            is_pending_connect_[backend_fd] = true;
+
+            // Register backend: EPOLLOUT fires when the connect() completes
+            if (!epoll_.add_socket(backend_fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP)) {
+                client_sockets_[backend_fd].reset();
+                is_pending_connect_[backend_fd] = false;
+                continue;
             }
+
+            // Register client and link both ends as partners
+            if (!epoll_.add_socket(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP)) {
+                epoll_.remove_socket(backend_fd);
+                client_sockets_[backend_fd].reset();
+                is_pending_connect_[backend_fd] = false;
+                continue;
+            }
+
+            client_sockets_[client_fd] = std::move(*client_opt);
+            socket_partners_[client_fd] = backend_fd;
+            socket_partners_[backend_fd] = client_fd;
         }
     }
 
@@ -88,11 +129,13 @@ private:
 
         epoll_.remove_socket(fd);
         write_buffers_[fd].clear();
+        is_pending_connect_[fd] = false;
 
         int partner_fd = socket_partners_[fd];
         if (partner_fd != -1 && partner_fd < max_fds_) {
             epoll_.remove_socket(partner_fd);
             write_buffers_[partner_fd].clear();
+            is_pending_connect_[partner_fd] = false;
             client_sockets_[partner_fd].reset();
             socket_partners_[partner_fd] = -1;
         }
@@ -117,6 +160,7 @@ public:
         client_sockets_.resize(max_fds_);
         socket_partners_.assign(max_fds_, -1);
         write_buffers_.resize(max_fds_);
+        is_pending_connect_.assign(max_fds_, false);
 
         listen_sock_.bind_and_listen(port);
         epoll_.add_socket(listen_sock_.get_fd(), EPOLLIN | EPOLLET);
@@ -190,6 +234,16 @@ public:
                     }
 
                     if (active_events & EPOLLOUT) {
+                        if (is_pending_connect_[active_fd]) {
+                            int err = 0;
+                            socklen_t err_len = sizeof(err);
+                            ::getsockopt(active_fd, SOL_SOCKET, SO_ERROR, &err, &err_len);
+                            if (err != 0) {
+                                drop_connection(active_fd);
+                                continue;
+                            }
+                            is_pending_connect_[active_fd] = false;
+                        }
                         flush_write_buffer(active_fd);
                     }
                 }

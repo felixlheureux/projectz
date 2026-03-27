@@ -17,6 +17,9 @@ pkg/
 compile_commands.json
 services/loadbalancer/loadbalancer
 
+# Generated protobuf bindings
+scripts/proto_build/
+
 # Scratch or temporary files
 test.cpp
 load_test_results/

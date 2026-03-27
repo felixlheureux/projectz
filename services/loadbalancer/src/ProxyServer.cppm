@@ -27,10 +27,10 @@ private:
     std::atomic<bool> is_running_{true};
 
 public:
-    ProxyServer(int port, std::string backend_hostname)
+    ProxyServer(int port, std::string backend_hostname, int backend_port = 8080)
         : port_(port),
           num_workers_(static_cast<int>(std::thread::hardware_concurrency())),
-          dns_resolver_(std::make_shared<DnsResolver>(std::move(backend_hostname), 8080))
+          dns_resolver_(std::make_shared<DnsResolver>(std::move(backend_hostname), backend_port))
     {
         // Minimum 1 worker even if hardware_concurrency() returns 0
         if (num_workers_ < 1) num_workers_ = 1;
