@@ -1,0 +1,25 @@
+# Monorepo Build Directories
+build/
+target/
+bin/
+pkg/
+
+# Compiled object files, caches, and executables
+*.o
+*.pcm
+*.so
+*.a
+*.exe
+*.out
+.cache/
+compile_commands.json
+services/loadbalancer/loadbalancer
+
+# Scratch or temporary files
+test.cpp
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
