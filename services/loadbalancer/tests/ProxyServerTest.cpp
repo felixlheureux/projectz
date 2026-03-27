@@ -68,3 +68,62 @@ TEST(ProxyServerIntegrationTest, EdgeTriggeredBufferDraining) {
     // and blasting oversize buffers will NOT deadlock or trigger Segmentation Faults.
     SUCCEED();
 }
+
+// Test 5: Multi-threaded worker accept distribution
+// Validates that multiple concurrent clients can connect when N worker threads
+// are each running their own epoll + listen socket via SO_REUSEPORT.
+TEST(ProxyServerIntegrationTest, ConcurrentClientAcceptDistribution) {
+    std::atomic<bool> proxy_ready{false};
+    std::unique_ptr<ProxyServer> proxy;
+
+    std::thread proxy_worker([&]() {
+        proxy = std::make_unique<ProxyServer>(8082, "localhost");
+        proxy_ready.store(true);
+        proxy->run();
+    });
+
+    while (!proxy_ready.load()) {
+        std::this_thread::yield();
+    }
+    // Let all worker threads start their epoll loops
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    constexpr int NUM_CLIENTS = 10;
+    std::atomic<int> connected{0};
+    std::vector<std::thread> client_threads;
+
+    for (int i = 0; i < NUM_CLIENTS; ++i) {
+        client_threads.emplace_back([&connected]() {
+            int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) return;
+
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(8082);
+            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+            if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+                connected.fetch_add(1, std::memory_order_relaxed);
+                // Send a small payload to exercise the read path
+                const char msg[] = "ping";
+                ::send(sock, msg, sizeof(msg), 0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            ::close(sock);
+        });
+    }
+
+    for (auto& t : client_threads) {
+        if (t.joinable()) t.join();
+    }
+
+    // All clients should have connected successfully
+    EXPECT_EQ(connected.load(), NUM_CLIENTS);
+
+    proxy->stop();
+    if (proxy_worker.joinable()) {
+        proxy_worker.join();
+    }
+
+    SUCCEED();
+}

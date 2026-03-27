@@ -39,6 +39,7 @@ target_sources(loadbalancer_core
     src/Socket.cppm
     src/Epoll.cppm
     src/DnsResolver.cppm
+    src/ProxyWorker.cppm
     src/ProxyServer.cppm
 )
 

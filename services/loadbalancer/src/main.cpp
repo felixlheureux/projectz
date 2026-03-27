@@ -24,7 +24,8 @@ int main() {
         // The DNS resolver will target the local headless service.
         g_proxy = std::make_unique<ProxyServer>(8080, "ingestion-headless.default.svc.cluster.local");
         
-        std::cout << "[Loadbalancer] Proxy loop started. Awaiting telemetry..." << std::endl;
+        std::cout << "[Loadbalancer] Starting " << g_proxy->num_workers() 
+                  << " worker threads. Awaiting telemetry..." << std::endl;
 
         // Enter the exception-free hot path
         g_proxy->run();
