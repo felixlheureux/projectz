@@ -19,6 +19,7 @@ services/loadbalancer/loadbalancer
 
 # Scratch or temporary files
 test.cpp
+load_test_results/
 
 # Editors and OS
 .vscode/

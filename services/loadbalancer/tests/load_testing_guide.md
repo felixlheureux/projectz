@@ -15,19 +15,19 @@ ulimit -n 1000000
 
 ---
 
-## 1. Saturation Testing (`iperf3` / `wrk`)
-To validate the EPOLLET looping and strict core routing throughput, you must exhaust the TCP stack using dynamic injection arrays. We split tests between raw packets (`iperf3`) and structured TCP connections (`wrk`).
+## 1. Saturation Testing (Native TCP Spammer)
+To validate the EPOLLET looping and strict core routing throughput, you must exhaust the TCP stack. We use the custom built `scripts/tcp_spammer.cpp` orchestrator via `load_test.sh` because this is a Layer 4 proxy with no HTTP routing logic to answer external tools like `wrk`.
 
 **Validate High Connections Matrix:**
-*Start the proxy normally.*
+*Start the proxy in the background:*
 ```bash
-./loadbalancer
+make run-release &
 ```
-*Spawn `wrk` with massive threading scaling to validate 250k.*
+*Run the native load testing suite:*
 ```bash
-wrk -t32 -c250000 -d60s http://127.0.0.1:8080/
+make load-test
 ```
-*Metrics Check:* Success means `socket errors: timeout X` remains minimal, while `connect X` states register perfectly.
+*Metrics Check:* Our custom script will compile and saturate the active worker loops, measuring pure generic TCP connections per second (CPS) established.
 
 ---
 

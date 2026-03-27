@@ -46,7 +46,7 @@ target_sources(loadbalancer_core
 # Apply our production-ready compiler flags strictly to the CORE logic
 target_compile_options(loadbalancer_core PRIVATE
     -Wall -Wextra -Wpedantic -Werror -pthread
-    $<$<CONFIG:Release>:-O3 -flto>
+    $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:Debug>:-O0 -g>
 )
 
