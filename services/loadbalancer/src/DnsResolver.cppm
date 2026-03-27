@@ -10,7 +10,6 @@ module;
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <cstring>
-#include <iostream>
 
 // Formally declare this file as the DnsResolver Module
 export module DnsResolver;
@@ -54,10 +53,12 @@ private:
         
         ::freeaddrinfo(result);
 
-        // 2. The Background Thread (Writer): Atomic Store.
-        // Overwrite the global atomic pointer with the new std::shared_ptr.
-        // The memory_order_release guarantees all memory operations above are visible to threads performing an acquire pass.
-        current_table_.store(new_table, std::memory_order_release);
+        // Standard: Implement a validation check ensuring new_table->size() > 0
+        if (!new_table->empty()) {
+            // 2. The Background Thread (Writer): Atomic Store.
+            // Overwrite the global atomic pointer with the new std::shared_ptr.
+            current_table_.store(new_table, std::memory_order_release);
+        }
     }
 
     void run_loop() noexcept {

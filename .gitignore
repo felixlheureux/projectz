@@ -1,5 +1,7 @@
 # Monorepo Build Directories
 build/
+build_*/
+_deps/
 target/
 bin/
 pkg/

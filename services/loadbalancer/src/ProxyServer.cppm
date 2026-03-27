@@ -8,7 +8,7 @@ module;
 #include <cerrno>
 #include <unistd.h>
 #include <sys/epoll.h>
-#include <memory>
+#include <atomic>
 
 export module ProxyServer;
 
@@ -24,6 +24,7 @@ private:
     Epoll epoll_;
     Socket listen_sock_;
     DnsResolver dns_resolver_;
+    std::atomic<bool> is_running_{true};
 
     // Deterministic Connection Pool (Idioms 1, 2, and 4)
     // Pre-allocated array indexed by the socket's integer file descriptor.
@@ -87,6 +88,10 @@ public:
         epoll_.add_socket(listen_sock_.get_fd(), EPOLLIN | EPOLLET);
     }
 
+    void stop() noexcept {
+        is_running_.store(false, std::memory_order_release);
+    }
+
     // Run the Proxy - Exception-Free Hot Path (Idiom 3)
     void run() noexcept {
         // Stack-Allocated Contiguous Memory Buffer (Idiom 4)
@@ -94,8 +99,9 @@ public:
 
         std::cout << "[Loadbalancer] Proxy Loop Started. Awaiting telemetry..." << std::endl;
 
-        while (true) {
-            int num_events = epoll_.wait(events, -1);
+        while (is_running_.load(std::memory_order_acquire)) {
+            // Unblocks periodically to check atomic stop flag instead of hanging infinitely
+            int num_events = epoll_.wait(events, 1000);
             if (num_events < 0) {
                 if (errno == EINTR) continue;
                 break; // A fatal underlying system error terminated the poll loop
@@ -117,10 +123,44 @@ public:
                     // Bidirectional Multiplexing (Specs.md Component Deep Dive)
                     if (active_events & EPOLLIN) {
                         // Received Ingress Telemetry from the Edge Agent OR an explicit Application ACK from Go Ingestion Pod
-                        // Buffer -> Route via DnsResolver -> Forward to Partner FD
+                        // Standard: Edge-Triggered Data Draining
+                        char buffer[4096];
+                        while (true) {
+                            ssize_t bytes_read = ::read(active_fd, buffer, sizeof(buffer));
+                            if (bytes_read == 0) {
+                                // Peer cleanly disconnected
+                                drop_connection(active_fd);
+                                break;
+                            } else if (bytes_read < 0) {
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    // Successfully drained the edge-triggered buffer
+                                    break;
+                                } else if (errno == EINTR) {
+                                    continue;
+                                }
+                                drop_connection(active_fd);
+                                break;
+                            }
+                            
+                            // Buffer -> Route via DnsResolver -> Forward to Partner FD
+                            int partner_fd = socket_partners_[active_fd];
+                            if (partner_fd != -1) {
+                                // Forwarding bytes directly to partner
+                                ssize_t bytes_written = 0;
+                                while (bytes_written < bytes_read) {
+                                    ssize_t res = ::write(partner_fd, buffer + bytes_written, bytes_read - bytes_written);
+                                    if (res < 0) {
+                                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
+                                        break; // In full proxy, drop_connection(partner_fd) might occur
+                                    }
+                                    bytes_written += res;
+                                }
+                            }
+                        }
                     }
                     if (active_events & EPOLLOUT) {
                         // Socket is writable: Drain our local application proxy ring-buffer to the TCP network buffer
+                        // Normally this would also loop on write() until EAGAIN.
                     }
                 }
             }
