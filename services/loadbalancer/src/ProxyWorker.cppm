@@ -11,6 +11,7 @@ module;
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <atomic>
 
 export module ProxyWorker;
@@ -92,6 +93,11 @@ private:
             int backend_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
             if (backend_fd < 0) continue;
             if (backend_fd >= max_fds_) { ::close(backend_fd); continue; }
+
+            // Mirror the client-side TCP_NODELAY: disable Nagle on the backend leg
+            // to prevent up to 40ms coalescing delay on small Protobuf payloads
+            int nodelay = 1;
+            ::setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
             // Non-blocking connect: returns immediately with EINPROGRESS
             int ret = ::connect(backend_fd,
