@@ -10,40 +10,40 @@ export module FileDescriptor;
 // Export the class so it is visible to anything that imports this module
 export class FileDescriptor {
 private:
-    int fd;
+    int fd_;
 
 public:
-    explicit FileDescriptor(int descriptor) : fd(descriptor) {
-        if (fd < 0) {
+    explicit FileDescriptor(int descriptor) : fd_(descriptor) {
+        if (fd_ < 0) {
             throw std::runtime_error("Invalid file descriptor initialized.");
         }
     }
 
     ~FileDescriptor() {
-        if (fd >= 0) {
-            close(fd);
+        if (fd_ >= 0) {
+            ::close(fd_);
         }
     }
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
-    FileDescriptor(FileDescriptor&& other) noexcept : fd(other.fd) {
-        other.fd = -1;
+    FileDescriptor(FileDescriptor&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
     }
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
-            if (fd >= 0) {
-                close(fd);
+            if (fd_ >= 0) {
+                ::close(fd_);
             }
-            fd = other.fd;
-            other.fd = -1;
+            fd_ = other.fd_;
+            other.fd_ = -1;
         }
         return *this;
     }
 
-    [[nodiscard]] int get() const {
-        return fd;
+    [[nodiscard]] int get() const noexcept {
+        return fd_;
     }
 };
