@@ -20,6 +20,9 @@ services/loadbalancer/loadbalancer
 # Generated protobuf bindings
 scripts/proto_build/
 
+# Compiled script binaries
+scripts/tcp_spammer
+
 # Scratch or temporary files
 test.cpp
 load_test_results/
