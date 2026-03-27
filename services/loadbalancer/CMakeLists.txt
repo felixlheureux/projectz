@@ -52,6 +52,7 @@ target_compile_options(loadbalancer_core PRIVATE
 # 2. Main Executable (Links to Core)
 add_executable(loadbalancer src/main.cpp)
 target_link_libraries(loadbalancer PRIVATE loadbalancer_core)
+target_compile_options(loadbalancer PRIVATE -pthread)
 target_link_options(loadbalancer PRIVATE -pthread)
 
 # 3. Test Executable (Links to Core + GTest)

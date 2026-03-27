@@ -20,8 +20,8 @@ private:
 public:
     // Factory method for creating the epoll instance.
     // Allowed to throw std::system_error since this is the initial configuration phase
-    static Epoll create() {
-        int epoll_fd = ::epoll_create1(0);
+    [[nodiscard]] static Epoll create() {
+        int epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
         if (epoll_fd < 0) {
             throw std::system_error(errno, std::system_category(), "Failed to create epoll instance");
         }

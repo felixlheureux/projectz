@@ -1,14 +1,15 @@
 // The Global Module Fragment
 module;
 
-#include <iostream>
 #include <array>
 #include <vector>
+#include <string>
 #include <optional>
 #include <cerrno>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <atomic>
+#include <cstring>
 
 export module ProxyServer;
 
@@ -33,8 +34,48 @@ private:
     std::vector<std::optional<Socket>> client_sockets_;
     
     // Tracks bidirectional multiplexing pairings (client_fd -> backend_fd and vice versa)
-    // For simplicity of this demonstration, we just track partner FDs as basic ints.
     std::vector<int> socket_partners_;
+
+    // Per-connection write buffers for back-pressure handling.
+    // When write() returns EAGAIN, unwritten bytes are stored here and
+    // EPOLLOUT is registered. When the socket becomes writable, the buffer
+    // is drained and EPOLLOUT is removed once empty.
+    std::vector<std::vector<char>> write_buffers_;
+
+    void enqueue_write(int fd, const char* data, ssize_t len) noexcept {
+        if (fd < 0 || fd >= MAX_FDS) return;
+        auto& buf = write_buffers_[fd];
+        buf.insert(buf.end(), data, data + len);
+        // Register EPOLLOUT so we get notified when the socket is writable
+        epoll_.modify_socket(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+    }
+
+    void flush_write_buffer(int fd) noexcept {
+        if (fd < 0 || fd >= MAX_FDS) return;
+        auto& buf = write_buffers_[fd];
+        
+        size_t total_sent = 0;
+        while (total_sent < buf.size()) {
+            ssize_t res = ::write(fd, buf.data() + total_sent, buf.size() - total_sent);
+            if (res < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
+                // Fatal write error on this FD
+                drop_connection(fd);
+                return;
+            }
+            total_sent += static_cast<size_t>(res);
+        }
+
+        if (total_sent > 0) {
+            buf.erase(buf.begin(), buf.begin() + static_cast<long>(total_sent));
+        }
+
+        // Buffer fully drained: remove EPOLLOUT to stop writable notifications
+        if (buf.empty()) {
+            epoll_.modify_socket(fd, EPOLLIN | EPOLLET | EPOLLRDHUP);
+        }
+    }
 
     void handle_new_connection() noexcept {
         while (true) {
@@ -50,26 +91,32 @@ private:
                 continue; 
             }
 
-            // Bidirectional Multiplexing (Specs.md): Register for EPOLLIN and EPOLLOUT with Edge Trigger (EPOLLET)
-            if (epoll_.add_socket(client_fd, EPOLLIN | EPOLLOUT | EPOLLET)) {
-                // Strict Move Semantics (Idiom 2): Transfer ownership of the Socket into our pre-allocated slab.
+            // Register for EPOLLIN with Edge Trigger (EPOLLET) and EPOLLRDHUP for clean peer shutdown detection.
+            // EPOLLOUT is intentionally NOT registered here to avoid thundering herd on idle connections.
+            // It is added dynamically by enqueue_write() only when there is pending write data.
+            if (epoll_.add_socket(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP)) {
                 client_sockets_[client_fd] = std::move(*client_opt);
-                socket_partners_[client_fd] = -1; // Unpaired initially until backend routing logic executes
+                socket_partners_[client_fd] = -1;
             }
         }
     }
 
     void drop_connection(int fd) noexcept {
+        // Bounds check to prevent out-of-bounds vector access on unexpected FDs
+        if (fd < 0 || fd >= MAX_FDS) return;
+
         epoll_.remove_socket(fd);
+        write_buffers_[fd].clear();
         
         int partner_fd = socket_partners_[fd];
-        if (partner_fd != -1) {
+        if (partner_fd != -1 && partner_fd < MAX_FDS) {
             epoll_.remove_socket(partner_fd);
-            client_sockets_[partner_fd].reset(); // Destroy RAII socket, triggering close()
+            write_buffers_[partner_fd].clear();
+            client_sockets_[partner_fd].reset();
             socket_partners_[partner_fd] = -1;
         }
 
-        client_sockets_[fd].reset(); // Destroy RAII socket, triggering close() and preventing leak (Idiom 1)
+        client_sockets_[fd].reset();
         socket_partners_[fd] = -1;
     }
 
@@ -83,6 +130,7 @@ public:
         // Pre-allocate the deterministic routing/connection space
         client_sockets_.resize(MAX_FDS);
         socket_partners_.assign(MAX_FDS, -1);
+        write_buffers_.resize(MAX_FDS);
 
         listen_sock_.bind_and_listen(port);
         epoll_.add_socket(listen_sock_.get_fd(), EPOLLIN | EPOLLET);
@@ -96,8 +144,6 @@ public:
     void run() noexcept {
         // Stack-Allocated Contiguous Memory Buffer (Idiom 4)
         std::array<epoll_event, MAX_EVENTS> events;
-
-        std::cout << "[Loadbalancer] Proxy Loop Started. Awaiting telemetry..." << std::endl;
 
         while (is_running_.load(std::memory_order_acquire)) {
             // Unblocks periodically to check atomic stop flag instead of hanging infinitely
@@ -114,53 +160,56 @@ public:
                 if (active_fd == listen_sock_.get_fd()) {
                     handle_new_connection();
                 } else {
-                    // Dropped / Closed connections handling
                     if (active_events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                         drop_connection(active_fd);
                         continue;
                     }
 
-                    // Bidirectional Multiplexing (Specs.md Component Deep Dive)
                     if (active_events & EPOLLIN) {
-                        // Received Ingress Telemetry from the Edge Agent OR an explicit Application ACK from Go Ingestion Pod
-                        // Standard: Edge-Triggered Data Draining
                         char buffer[4096];
                         while (true) {
                             ssize_t bytes_read = ::read(active_fd, buffer, sizeof(buffer));
                             if (bytes_read == 0) {
-                                // Peer cleanly disconnected
                                 drop_connection(active_fd);
                                 break;
                             } else if (bytes_read < 0) {
-                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                    // Successfully drained the edge-triggered buffer
-                                    break;
-                                } else if (errno == EINTR) {
-                                    continue;
-                                }
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                                if (errno == EINTR) continue;
                                 drop_connection(active_fd);
                                 break;
                             }
                             
-                            // Buffer -> Route via DnsResolver -> Forward to Partner FD
+                            if (active_fd >= MAX_FDS) break;
                             int partner_fd = socket_partners_[active_fd];
                             if (partner_fd != -1) {
-                                // Forwarding bytes directly to partner
+                                // If backlog already exists, append directly—no point attempting a write
+                                // that will just pile up out-of-order data.
+                                if (!write_buffers_[partner_fd].empty()) {
+                                    enqueue_write(partner_fd, buffer, bytes_read);
+                                    continue;
+                                }
+
                                 ssize_t bytes_written = 0;
                                 while (bytes_written < bytes_read) {
                                     ssize_t res = ::write(partner_fd, buffer + bytes_written, bytes_read - bytes_written);
                                     if (res < 0) {
-                                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
-                                        break; // In full proxy, drop_connection(partner_fd) might occur
+                                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                            // Buffer the remaining unsent bytes and register EPOLLOUT
+                                            enqueue_write(partner_fd, buffer + bytes_written, bytes_read - bytes_written);
+                                            break;
+                                        }
+                                        if (errno == EINTR) continue;
+                                        drop_connection(partner_fd);
+                                        break;
                                     }
                                     bytes_written += res;
                                 }
                             }
                         }
                     }
+
                     if (active_events & EPOLLOUT) {
-                        // Socket is writable: Drain our local application proxy ring-buffer to the TCP network buffer
-                        // Normally this would also loop on write() until EAGAIN.
+                        flush_write_buffer(active_fd);
                     }
                 }
             }

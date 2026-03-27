@@ -28,7 +28,6 @@ private:
 
     void query_dns_once() noexcept {
         addrinfo hints{};
-        std::memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_INET;       // Strictly IPv4 per specs
         hints.ai_socktype = SOCK_STREAM;
         
@@ -45,9 +44,10 @@ private:
         
         for (addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next) {
             if (ptr->ai_family == AF_INET) {
-                sockaddr_in* ipv4 = reinterpret_cast<sockaddr_in*>(ptr->ai_addr);
-                ipv4->sin_port = htons(port_); // Inject the target application port
-                new_table->push_back(*ipv4);
+                // Copy the sockaddr_in before modifying—don't write to getaddrinfo-owned memory
+                sockaddr_in addr = *reinterpret_cast<sockaddr_in*>(ptr->ai_addr);
+                addr.sin_port = htons(port_);
+                new_table->push_back(addr);
             }
         }
         
@@ -95,9 +95,12 @@ public:
         }
     }
 
-    // Explicitly delete copy semantics to prevent thread duplication errors
+    // Explicitly delete copy and move semantics.
+    // This class owns a running std::thread capturing `this`—moving it would invalidate the pointer.
     DnsResolver(const DnsResolver&) = delete;
     DnsResolver& operator=(const DnsResolver&) = delete;
+    DnsResolver(DnsResolver&&) = delete;
+    DnsResolver& operator=(DnsResolver&&) = delete;
     
     // 3. The epoll Thread (Reader): Atomic Load
     // Lock-free method for the hot-path epoll loop to retrieve the active routes
