@@ -17,9 +17,6 @@ pkg/
 compile_commands.json
 services/loadbalancer/loadbalancer
 
-# Generated protobuf bindings
-scripts/proto_build/
-
 # Compiled script binaries
 scripts/tcp_spammer
 

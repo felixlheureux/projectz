@@ -4,6 +4,9 @@
 # Default just builds the project
 all: build
 
+# Scripts live two levels up at the repo root.
+SCRIPTS_DIR := ../../scripts
+
 # ──────────────── Development ────────────────
 
 # 1. Generate the standard Ninja build files
@@ -20,18 +23,18 @@ run: build
 
 # ──────────────── Testing ────────────────
 
-# 4. Standard Unit Testing (No sanitizers)
+# 4. Standard Unit + Integration Tests (no sanitizers)
 test: configure
 	cmake --build build --target proxy_tests
 	./build/proxy_tests
 
-# 5. Testing under AddressSanitizer
+# 5. Tests under AddressSanitizer
 test-asan:
 	cmake -B build_asan -G Ninja -DENABLE_ASAN=ON
 	cmake --build build_asan --target proxy_tests
 	./build_asan/proxy_tests
 
-# 6. Testing under ThreadSanitizer
+# 6. Tests under ThreadSanitizer
 test-tsan:
 	cmake -B build_tsan -G Ninja -DENABLE_TSAN=ON
 	cmake --build build_tsan --target proxy_tests
@@ -50,19 +53,20 @@ run-release: release
 
 # 9. Apply kernel tuning (requires sudo)
 tune:
-	sudo bash scripts/tune_kernel.sh
+	sudo bash $(SCRIPTS_DIR)/tune_kernel.sh
 
-# 10. Run the load test ramp (proxy must be running)
+# 10. Self-contained CPS load test (builds proxy + spammer, starts backend, cleans up)
+#     Usage: make load-test [DURATION=30]
 load-test:
-	bash scripts/load_test.sh
+	bash $(SCRIPTS_DIR)/load_test.sh $(DURATION)
 
 # 11. Monitor the running proxy in real-time (requires sudo)
 monitor:
-	sudo bash scripts/monitor.sh
+	sudo bash $(SCRIPTS_DIR)/monitor.sh
 
 # 12. CPU profile the running proxy (requires sudo)
 profile:
-	sudo bash scripts/profile.sh
+	sudo bash $(SCRIPTS_DIR)/profile.sh
 
 # ──────────────── Cleanup ────────────────
 
