@@ -12,6 +12,7 @@ sysctl -w net.ipv4.tcp_max_syn_backlog=65535
 sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 sysctl -w net.core.netdev_max_backlog=50000
 sysctl -w net.ipv4.tcp_tw_reuse=1
+sysctl -w vm.nr_hugepages=1024
 
 echo "[tune_kernel] Persisting to /etc/sysctl.d/99-loadbalancer.conf..."
 
@@ -23,6 +24,7 @@ net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.ip_local_port_range = 1024 65535
 net.core.netdev_max_backlog = 50000
 net.ipv4.tcp_tw_reuse = 1
+vm.nr_hugepages = 1024
 EOF
 
 echo "[tune_kernel] Setting process FD limits..."

@@ -1,5 +1,5 @@
 .PHONY: all configure build run test test-asan test-tsan clean \
-       release run-release tune load-test monitor profile
+       release run-release setup tune load-test monitor profile
 
 # Default just builds the project
 all: build
@@ -51,20 +51,24 @@ release:
 run-release: release
 	./build_release/loadbalancer
 
-# 9. Apply kernel tuning (requires sudo)
+# 9. Install build dependencies (run once on a fresh machine)
+setup:
+	sudo apt-get install -y liburing-dev
+
+# 10. Apply kernel tuning (requires sudo)
 tune:
 	sudo bash $(SCRIPTS_DIR)/tune_kernel.sh
 
-# 10. Self-contained CPS load test (builds proxy + spammer, starts backend, cleans up)
+# 11. Self-contained CPS load test (builds proxy + spammer, starts backend, cleans up)
 #     Usage: make load-test [DURATION=30]
 load-test:
 	bash $(SCRIPTS_DIR)/load_test.sh $(DURATION)
 
-# 11. Monitor the running proxy in real-time (requires sudo)
+# 12. Monitor the running proxy in real-time (requires sudo)
 monitor:
 	sudo bash $(SCRIPTS_DIR)/monitor.sh
 
-# 12. CPU profile the running proxy (requires sudo)
+# 13. CPU profile the running proxy (requires sudo)
 profile:
 	sudo bash $(SCRIPTS_DIR)/profile.sh
 

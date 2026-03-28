@@ -1,301 +1,341 @@
-// The Global Module Fragment
 module;
 
-#include <array>
+#include <iostream>
 #include <vector>
-#include <string>
-#include <optional>
 #include <memory>
-#include <cerrno>
+#include <atomic>
 #include <unistd.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <atomic>
+#include <liburing.h>
+#include <sys/mman.h>
+#include <arpa/inet.h>
 
 export module ProxyWorker;
 
 import Socket;
-import Epoll;
 import FileDescriptor;
 import DnsResolver;
+import IoUring;
+import OperationContext;
 
-// A single-threaded event loop worker. Each worker owns its own listen socket
-// (bound to the shared port via SO_REUSEPORT), its own epoll instance, and its
-// own connection pool. The kernel distributes incoming SYN packets across workers,
-// guaranteeing zero contention between threads on the accept path.
 export class ProxyWorker {
 private:
-    static constexpr int MAX_EVENTS = 1024;
+    static constexpr unsigned RING_DEPTH = 32768;
+    static constexpr int BUFFER_SIZE = 4096;
+    static constexpr int BGID = 1; 
 
     int worker_id_;
-    int max_fds_;
-    Epoll epoll_;
-    Socket listen_sock_;
+    int port_;
     std::shared_ptr<DnsResolver> dns_resolver_;
     std::atomic<bool>& is_running_;
+    
+    Socket listen_sock_;
+    IoUring ring_;
 
-    int max_connections_;        // hard cap: max_fds_ / 2 (2 fds per client+backend pair)
-    int active_connections_{0};  // live pairs tracked by this worker
+    std::vector<OperationContext> ctx_storage_;
+    std::vector<OperationContext*> ctx_free_list_;
+
+    size_t buffers_count_;
+    ::io_uring_buf_ring *br_;
+    void *br_ptr_;
 
     size_t round_robin_index_{0};
-    std::vector<std::optional<Socket>> client_sockets_;
-    std::vector<int> socket_partners_;
-    std::vector<std::vector<char>> write_buffers_;
-    std::vector<bool> is_pending_connect_;
 
-    // Set SO_LINGER{on=1, linger=0} so the next close() sends RST instead of FIN.
-    // Used on every rejection path so clients fail fast (ECONNRESET) rather than
-    // discovering capacity exhaustion only after a full TCP teardown.
-    static void reject_with_rst(int fd) noexcept {
-        linger sl{};
-        sl.l_onoff  = 1;
-        sl.l_linger = 0;
-        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
-        // Caller's Socket RAII destructor calls close() -> RST dispatched by kernel
+    OperationContext* acquire_ctx() {
+        if (ctx_free_list_.empty()) return nullptr;
+        OperationContext* ctx = ctx_free_list_.back();
+        ctx_free_list_.pop_back();
+        return ctx;
     }
 
-    void enqueue_write(int fd, const char* data, ssize_t len) noexcept {
-        if (fd < 0 || fd >= max_fds_) return;
-        auto& buf = write_buffers_[fd];
-        buf.insert(buf.end(), data, data + len);
-        epoll_.modify_socket(fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+    void release_ctx(OperationContext* ctx) {
+        ctx_free_list_.push_back(ctx);
     }
 
-    void flush_write_buffer(int fd) noexcept {
-        if (fd < 0 || fd >= max_fds_) return;
-        auto& buf = write_buffers_[fd];
-
-        size_t total_sent = 0;
-        while (total_sent < buf.size()) {
-            ssize_t res = ::write(fd, buf.data() + total_sent, buf.size() - total_sent);
-            if (res < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                if (errno == EINTR) continue;
-                drop_connection(fd);
-                return;
-            }
-            total_sent += static_cast<size_t>(res);
-        }
-
-        if (total_sent > 0) {
-            buf.erase(buf.begin(), buf.begin() + static_cast<long>(total_sent));
-        }
-
-        if (buf.empty()) {
-            epoll_.modify_socket(fd, EPOLLIN | EPOLLET | EPOLLRDHUP);
-        }
+    sockaddr_in resolve_backend() {
+        // Source/Dest IP Multiplexing to expand 4-tuple space and prevent exhaustion
+        // Generates 127.0.0.1 through 127.0.0.20 as the destination IP
+        sockaddr_in dest{};
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(8081);
+        
+        uint32_t base_ip = ntohl(inet_addr("127.0.0.1"));
+        uint32_t ip_offset = (round_robin_index_++ % 20);
+        dest.sin_addr.s_addr = htonl(base_ip + ip_offset);
+        
+        return dest;
     }
 
-    void handle_new_connection() noexcept {
-        while (true) {
-            auto client_opt = listen_sock_.accept_connection();
-            if (!client_opt) break;
-
-            int client_fd = client_opt->get_fd();
-
-            // Circuit breaker: worker is at capacity — RST immediately so the client
-            // gets ECONNRESET and can retry another node without a slow FIN teardown.
-            if (active_connections_ >= max_connections_ || client_fd >= max_fds_) {
-                reject_with_rst(client_fd);
-                continue; // client_opt destructs -> close() -> RST
-            }
-
-            // RCU load: lock-free snapshot of the current backend list
-            auto table = dns_resolver_->get_routing_table();
-            if (!table || table->empty()) {
-                reject_with_rst(client_fd);
-                continue;
-            }
-
-            // Round-robin backend selection
-            const sockaddr_in& dest = (*table)[round_robin_index_++ % table->size()];
-
-            // Create a non-blocking outbound socket for the backend leg
-            int backend_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-            if (backend_fd < 0) {
-                reject_with_rst(client_fd);
-                continue;
-            }
-            if (backend_fd >= max_fds_) {
-                ::close(backend_fd);
-                reject_with_rst(client_fd);
-                continue;
-            }
-
-            // Mirror the client-side TCP_NODELAY: disable Nagle on the backend leg
-            // to prevent up to 40ms coalescing delay on small Protobuf payloads
-            int nodelay = 1;
-            ::setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-            // Non-blocking connect: returns immediately with EINPROGRESS
-            int ret = ::connect(backend_fd,
-                                reinterpret_cast<const sockaddr*>(&dest),
-                                sizeof(dest));
-            if (ret < 0 && errno != EINPROGRESS) {
-                ::close(backend_fd);
-                reject_with_rst(client_fd);
-                continue;
-            }
-
-            // Hand ownership to RAII socket wrapper
-            client_sockets_[backend_fd] = Socket{FileDescriptor{backend_fd}};
-            is_pending_connect_[backend_fd] = true;
-
-            // Register backend: EPOLLOUT fires when the connect() completes
-            if (!epoll_.add_socket(backend_fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP)) {
-                client_sockets_[backend_fd].reset();
-                is_pending_connect_[backend_fd] = false;
-                reject_with_rst(client_fd);
-                continue;
-            }
-
-            // Register client and link both ends as partners
-            if (!epoll_.add_socket(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP)) {
-                epoll_.remove_socket(backend_fd);
-                client_sockets_[backend_fd].reset();
-                is_pending_connect_[backend_fd] = false;
-                reject_with_rst(client_fd);
-                continue;
-            }
-
-            client_sockets_[client_fd] = std::move(*client_opt);
-            socket_partners_[client_fd] = backend_fd;
-            socket_partners_[backend_fd] = client_fd;
-            ++active_connections_;
-        }
+    void submit_multishot_accept() noexcept {
+        ::io_uring_sqe* sqe = ring_.get_sqe();
+        if (!sqe) return;
+        
+        OperationContext* ctx = acquire_ctx();
+        if (!ctx) return;
+        
+        ctx->type = OpType::MULTISHOT_ACCEPT;
+        
+        // Use direct alloc for zero-overhead socket mapping
+        ::io_uring_prep_multishot_accept_direct(sqe, listen_sock_.get_fd(), nullptr, nullptr, 0);
+        ::io_uring_sqe_set_data(sqe, ctx);
     }
 
-    void drop_connection(int fd) noexcept {
-        if (fd < 0 || fd >= max_fds_) return;
-
-        epoll_.remove_socket(fd);
-        write_buffers_[fd].clear();
-        is_pending_connect_[fd] = false;
-
-        int partner_fd = socket_partners_[fd];
-        if (partner_fd != -1 && partner_fd < max_fds_) {
-            --active_connections_;
-            epoll_.remove_socket(partner_fd);
-            write_buffers_[partner_fd].clear();
-            is_pending_connect_[partner_fd] = false;
-            client_sockets_[partner_fd].reset();
-            socket_partners_[partner_fd] = -1;
+    // Step 1: Allocate Backend Socket
+    void queue_backend_socket(int client_direct_fd) noexcept {
+        ::io_uring_sqe* sqe = ring_.get_sqe();
+        if (!sqe) {
+            drop_connection(client_direct_fd, -1);
+            return;
         }
 
-        client_sockets_[fd].reset();
-        socket_partners_[fd] = -1;
+        OperationContext* ctx = acquire_ctx();
+        if (!ctx) { drop_connection(client_direct_fd, -1); return; }
+
+        ctx->type = OpType::BACKEND_SOCKET_CREATE;
+        ctx->client_fd_direct = client_direct_fd;
+        ctx->backend_fd_direct = -1;
+
+        // Step 1: Allocate Backend Socket
+        ::io_uring_prep_socket_direct(sqe, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, IORING_FILE_INDEX_ALLOC, 0);
+        ::io_uring_sqe_set_data(sqe, ctx);
+    }
+
+    // Step 2: Establish the backend TCP connection
+    void queue_backend_connect(OperationContext* ctx, const sockaddr_in& dest_addr) noexcept {
+        ::io_uring_sqe* sqe_conn = ring_.get_sqe();
+        if (!sqe_conn) {
+            drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+            return;
+        }
+
+        ctx->type = OpType::BACKEND_CONNECT_WAIT;
+
+        // Execute Connect
+        ::io_uring_prep_connect(sqe_conn, ctx->backend_fd_direct, (sockaddr*)&dest_addr, sizeof(dest_addr));
+        sqe_conn->flags |= IOSQE_FIXED_FILE;
+        ::io_uring_sqe_set_data(sqe_conn, ctx);
+    }
+
+    void submit_read_request(int fd_direct, int target_fd_direct) noexcept {
+        ::io_uring_sqe* sqe = ring_.get_sqe();
+        if (!sqe) return;
+
+        OperationContext* ctx = acquire_ctx();
+        if (!ctx) {
+            drop_connection(fd_direct, target_fd_direct);
+            return;
+        }
+
+        ctx->type = OpType::CLIENT_READ;
+        ctx->client_fd_direct = fd_direct;
+        ctx->backend_fd_direct = target_fd_direct;
+
+        ::io_uring_prep_recv_multishot(sqe, fd_direct, nullptr, 0, 0);
+        sqe->flags |= IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT;
+        sqe->buf_group = BGID;
+        ::io_uring_sqe_set_data(sqe, ctx);
+    }
+
+    void submit_write_request(int target_fd_direct, int source_fd_direct, void* data, unsigned int len, unsigned short buffer_id) noexcept {
+        ::io_uring_sqe* sqe = ring_.get_sqe();
+        if (!sqe) {
+            drop_connection(target_fd_direct, source_fd_direct);
+            ::io_uring_buf_ring_add(br_, data, BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(buffers_count_), buffer_id - 1);
+            ::io_uring_buf_ring_advance(br_, 1);
+            return;
+        }
+
+        OperationContext* ctx = acquire_ctx();
+        if (!ctx) {
+            drop_connection(target_fd_direct, source_fd_direct);
+            ::io_uring_buf_ring_add(br_, data, BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(buffers_count_), buffer_id - 1);
+            ::io_uring_buf_ring_advance(br_, 1);
+            return;
+        }
+
+        ctx->type = OpType::BACKEND_WRITE;
+        ctx->backend_fd_direct = target_fd_direct; 
+        ctx->client_fd_direct = source_fd_direct;  
+        ctx->active_ip_index = buffer_id; // temporarily store buffer ID
+
+        ::io_uring_prep_send(sqe, target_fd_direct, data, len, 0);
+        sqe->flags |= IOSQE_FIXED_FILE;
+        ::io_uring_sqe_set_data(sqe, ctx);
+    }
+
+    void drop_connection(int fd1_direct, int fd2_direct) noexcept {
+        auto close_fd = [this](int fd_direct) {
+            if (fd_direct < 0) return;
+            ::io_uring_sqe* sqe_close = ring_.get_sqe();
+            
+            if (!sqe_close) {
+                // If the SQ ring is completely full, we must submit to flush it, 
+                // then grab a new SQE to ensure the close command is forced through.
+                ring_.submit(); 
+                sqe_close = ring_.get_sqe();
+                if (!sqe_close) return; // Extreme edge case
+            }
+            
+            ::io_uring_prep_close_direct(sqe_close, fd_direct);
+            
+            // We don't need to track the Completion Queue Entry for a close.
+            // Pass nullptr so we don't consume our ctx_free_list_ pool!
+            ::io_uring_sqe_set_data(sqe_close, nullptr); 
+        };
+
+        if (fd1_direct >= 0) close_fd(fd1_direct);
+        if (fd2_direct >= 0) close_fd(fd2_direct);
     }
 
 public:
-    // Each worker creates its own listen socket on the same port.
-    // SO_REUSEPORT (set inside Socket::bind_and_listen) allows this.
-    // The kernel distributes incoming connections across all workers.
     ProxyWorker(int worker_id, int port, std::shared_ptr<DnsResolver> dns,
                 std::atomic<bool>& is_running, int max_fds)
         : worker_id_(worker_id),
-          max_fds_(max_fds),
-          epoll_(Epoll::create()),
-          listen_sock_(Socket::create()),
+          port_(port),
           dns_resolver_(std::move(dns)),
-          is_running_(is_running)
+          is_running_(is_running),
+          listen_sock_(Socket::create()),
+          ring_(IoUring::create(RING_DEPTH))
     {
-        max_connections_ = max_fds_ / 2; // each pair consumes 2 fd slots
+        (void)max_fds;
+        listen_sock_.bind_and_listen(port_);
 
-        client_sockets_.resize(max_fds_);
-        socket_partners_.assign(max_fds_, -1);
-        write_buffers_.resize(max_fds_);
-        is_pending_connect_.assign(max_fds_, false);
+        // Register direct descriptor sparse table
+        ring_.register_files_sparse(65536);
 
-        listen_sock_.bind_and_listen(port);
-        epoll_.add_socket(listen_sock_.get_fd(), EPOLLIN | EPOLLET);
-    }
-
-    ProxyWorker(const ProxyWorker&) = delete;
-    ProxyWorker& operator=(const ProxyWorker&) = delete;
-    ProxyWorker(ProxyWorker&&) = delete;
-    ProxyWorker& operator=(ProxyWorker&&) = delete;
-
-    void run() noexcept {
-        std::array<epoll_event, MAX_EVENTS> events;
-
-        while (is_running_.load(std::memory_order_acquire)) {
-            int num_events = epoll_.wait(events, 1000);
-            if (num_events < 0) {
-                if (errno == EINTR) continue;
-                break;
-            }
-
-            for (int i = 0; i < num_events; ++i) {
-                int active_fd = events[i].data.fd;
-                uint32_t active_events = events[i].events;
-
-                if (active_fd == listen_sock_.get_fd()) {
-                    handle_new_connection();
-                } else {
-                    if (active_events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                        drop_connection(active_fd);
-                        continue;
-                    }
-
-                    if (active_events & EPOLLIN) {
-                        char buffer[4096];
-                        while (true) {
-                            ssize_t bytes_read = ::read(active_fd, buffer, sizeof(buffer));
-                            if (bytes_read == 0) {
-                                drop_connection(active_fd);
-                                break;
-                            } else if (bytes_read < 0) {
-                                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                                if (errno == EINTR) continue;
-                                drop_connection(active_fd);
-                                break;
-                            }
-
-                            if (active_fd >= max_fds_) break;
-                            int partner_fd = socket_partners_[active_fd];
-                            if (partner_fd != -1) {
-                                if (!write_buffers_[partner_fd].empty()) {
-                                    enqueue_write(partner_fd, buffer, bytes_read);
-                                    continue;
-                                }
-
-                                ssize_t bytes_written = 0;
-                                while (bytes_written < bytes_read) {
-                                    ssize_t res = ::write(partner_fd, buffer + bytes_written, bytes_read - bytes_written);
-                                    if (res < 0) {
-                                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                            enqueue_write(partner_fd, buffer + bytes_written, bytes_read - bytes_written);
-                                            break;
-                                        }
-                                        if (errno == EINTR) continue;
-                                        drop_connection(partner_fd);
-                                        break;
-                                    }
-                                    bytes_written += res;
-                                }
-                            }
-                        }
-                    }
-
-                    if (active_events & EPOLLOUT) {
-                        if (is_pending_connect_[active_fd]) {
-                            int err = 0;
-                            socklen_t err_len = sizeof(err);
-                            ::getsockopt(active_fd, SOL_SOCKET, SO_ERROR, &err, &err_len);
-                            if (err != 0) {
-                                drop_connection(active_fd);
-                                continue;
-                            }
-                            is_pending_connect_[active_fd] = false;
-                        }
-                        flush_write_buffer(active_fd);
-                    }
-                }
-            }
+        size_t pool_size = 131072;
+        ctx_storage_.resize(pool_size);
+        ctx_free_list_.reserve(pool_size);
+        for (size_t i = 0; i < pool_size; ++i) {
+            ctx_free_list_.push_back(&ctx_storage_[i]);
         }
+
+        buffers_count_ = 32768; // Power of 2 required
+        size_t br_size = buffers_count_ * BUFFER_SIZE;
+        
+        br_ptr_ = ::mmap(NULL, br_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        if (br_ptr_ == MAP_FAILED) {
+            ::posix_memalign(&br_ptr_, 4096, br_size);
+        }
+
+        int ret = 0;
+        br_ = ::io_uring_setup_buf_ring(&ring_.get_ring(), buffers_count_, BGID, 0, &ret);
+        if (!br_) {
+            std::cerr << "Failed to setup buf ring: " << ret << std::endl;
+            exit(1);
+        }
+
+        ::io_uring_buf_ring_init(br_);
+        char* base_ptr = static_cast<char*>(br_ptr_);
+        for (unsigned short i = 0; i < buffers_count_; i++) {
+            ::io_uring_buf_ring_add(br_, base_ptr + i * BUFFER_SIZE, BUFFER_SIZE, i+1, io_uring_buf_ring_mask(buffers_count_), i);
+        }
+        ::io_uring_buf_ring_advance(br_, buffers_count_);
     }
 
     [[nodiscard]] int id() const noexcept { return worker_id_; }
+
+    void run() noexcept {
+        std::cout << "[Loadbalancer] io_uring Proxy Loop Started (Worker " << worker_id_ << ")." << std::endl;
+
+        submit_multishot_accept();
+
+        while (is_running_.load(std::memory_order_acquire)) {
+            // submit and wait for 1 event cooperatively
+            int ret = ring_.submit_and_wait(1);
+            if (ret < 0 && ret != -EBUSY && ret != -EINTR && ret != -ETIME) {
+                // If overflow or fatal error, try to reap anyway
+            }
+
+            while (true) {
+                constexpr unsigned MAX_CQE_BATCH = 4096;
+                ::io_uring_cqe* cqes[MAX_CQE_BATCH];
+                unsigned count = ::io_uring_peek_batch_cqe(&ring_.get_ring(), cqes, MAX_CQE_BATCH);
+                if (count == 0) break;
+
+                for (unsigned i = 0; i < count; ++i) {
+                    ::io_uring_cqe* cqe = cqes[i];
+                    auto* ctx = static_cast<OperationContext*>(::io_uring_cqe_get_data(cqe));
+                    
+                    if (!ctx) continue;
+
+                    int res = cqe->res;
+                    int flags = cqe->flags;
+
+                    switch (ctx->type) {
+                        case OpType::MULTISHOT_ACCEPT:
+                            if (res >= 0) {
+                                queue_backend_socket(res);
+                            }
+                            // If IORING_CQE_F_MORE is clear, the multishot accept was terminated
+                            if (!(flags & IORING_CQE_F_MORE)) {
+                                release_ctx(ctx);
+                                if (is_running_.load(std::memory_order_relaxed)) {
+                                    submit_multishot_accept();
+                                }
+                            }
+                            break;
+
+                        case OpType::BACKEND_SOCKET_CREATE:
+                            if (res >= 0) {
+                                ctx->backend_fd_direct = res; // Save direct descriptor
+                                sockaddr_in dest = resolve_backend();
+                                queue_backend_connect(ctx, dest);
+                            } else {
+                                drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+                                release_ctx(ctx); // [FIX] Release on error
+                            }
+                            break;
+
+                        case OpType::BACKEND_CONNECT_WAIT:
+                            if (res == 0) {
+                                // Phase 2: Connect completed successfully
+                                submit_read_request(ctx->client_fd_direct, ctx->backend_fd_direct);
+                                submit_read_request(ctx->backend_fd_direct, ctx->client_fd_direct);
+                            } else {
+                                drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+                            }
+                            release_ctx(ctx); // [FIX] The connect phase is over. Free the context.
+                            break;
+
+                        case OpType::CLIENT_READ:
+                            if (res > 0) {
+                                unsigned short buffer_id = flags >> IORING_CQE_BUFFER_SHIFT;
+                                char* buf_addr = static_cast<char*>(br_ptr_) + ((buffer_id - 1) * BUFFER_SIZE);
+                                // Send data to destination
+                                submit_write_request(ctx->backend_fd_direct, ctx->client_fd_direct, buf_addr, res, buffer_id);
+                            } else if (res <= 0) {
+                                drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+                            }
+                            
+                            if (!(flags & IORING_CQE_F_MORE)) {
+                                release_ctx(ctx);
+                            }
+                            break;
+
+                        case OpType::BACKEND_WRITE:
+                            {
+                                unsigned short buffer_id = ctx->active_ip_index;
+                                char* buf_addr = static_cast<char*>(br_ptr_) + ((buffer_id - 1) * BUFFER_SIZE);
+                                // Restore buffer to ring
+                                ::io_uring_buf_ring_add(br_, buf_addr, BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(buffers_count_), buffer_id - 1);
+                                ::io_uring_buf_ring_advance(br_, 1);
+                                
+                                if (res < 0) {
+                                    drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+                                }
+                                release_ctx(ctx);
+                            }
+                            break;
+                        case OpType::CLOSE_CONNECTION:
+                            release_ctx(ctx);
+                            break;
+                    }
+                }
+                ::io_uring_cq_advance(&ring_.get_ring(), count);
+            }
+        }
+    }
 };

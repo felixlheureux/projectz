@@ -30,6 +30,11 @@ elseif(ENABLE_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
+# ── liburing (io_uring userspace library) ────────────────────────────────────
+# ProxyWorker uses io_uring instead of epoll.  Install with: make setup
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(URING REQUIRED liburing)
+
 # 1. Create the Core Library containing all C++23 Modules
 add_library(loadbalancer_core STATIC)
 target_sources(loadbalancer_core
@@ -37,11 +42,15 @@ target_sources(loadbalancer_core
     FILE_SET CXX_MODULES FILES
     src/FileDescriptor.cppm
     src/Socket.cppm
-    src/Epoll.cppm
+    src/OperationContext.cppm
+    src/IoUring.cppm
     src/DnsResolver.cppm
     src/ProxyWorker.cppm
     src/ProxyServer.cppm
 )
+
+target_include_directories(loadbalancer_core PUBLIC ${URING_INCLUDE_DIRS})
+target_link_libraries(loadbalancer_core PUBLIC ${URING_LIBRARIES})
 
 # Apply our production-ready compiler flags strictly to the CORE logic
 target_compile_options(loadbalancer_core PRIVATE
