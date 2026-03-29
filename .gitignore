@@ -22,8 +22,6 @@ scripts/tcp_spammer
 scripts/tcp_sink
 
 # ─── Go ──────────────────────────────────────────────────────────────────────
-# go.sum and *.pb.go are intentionally committed:
-# go.sum ensures reproducible builds, *.pb.go lets consumers skip protoc.
 
 # ─── Kubernetes / local dev ──────────────────────────────────────────────────
 *.pid

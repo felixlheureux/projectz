@@ -13,8 +13,9 @@ spec:
   triggers:
     - type: metrics-api
       metadata:
-        # KEDA scrapes the JSON endpoint — Prometheus text format is not supported
-        # by metrics-api trigger. /metrics/json returns plain JSON.
+        # Scale on active connections: 1 ingestion pod per 300 active connections.
+        # KEDA computes: desired = ceil(lb_active_connections / 300)
+        # queue_depth only goes non-zero when already overwhelmed — too late.
         url: "http://loadbalancer:9090/metrics/json"
-        valueLocation: "lb_queue_depth"
-        targetValue: "10"  # scale up when queue_depth > 10 per replica
+        valueLocation: "lb_active_connections"
+        targetValue: "300"

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <csignal>
 #include <deque>
+#include <fcntl.h>
 #include <iostream>
 #include <liburing.h>
 #include <netinet/in.h>
@@ -15,7 +16,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static constexpr unsigned RING_SIZE  = 256;
+static constexpr unsigned RING_SIZE  = 4096;
 static constexpr size_t SPLICE_SIZE  = 65536;
 static constexpr int QUEUE_MAX       = 1024;
 static constexpr int CONCURRENCY_MAX = 10000;
@@ -73,10 +74,15 @@ void close_rst(int &fd) {
    fd = -1;
 }
 
+// forward declaration — defined after op_done
+void begin_teardown(Op *op);
+
 // ─── io_uring submission helpers ─────────────────────────────────────────────
 
 void submit_fill(Op *op) {
    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+   if (!sqe) { io_uring_submit(&ring); sqe = io_uring_get_sqe(&ring); }
+   if (!sqe) { begin_teardown(op); return; }
    io_uring_prep_splice(sqe, op->src_fd, -1, op->pipe_wr, -1,
                         SPLICE_SIZE, SPLICE_F_MOVE);
    sqe->flags |= IOSQE_ASYNC;
@@ -86,6 +92,8 @@ void submit_fill(Op *op) {
 
 void submit_drain(Op *op) {
    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+   if (!sqe) { io_uring_submit(&ring); sqe = io_uring_get_sqe(&ring); }
+   if (!sqe) { begin_teardown(op); return; }
    io_uring_prep_splice(sqe, op->pipe_rd, -1, op->dst_fd, -1,
                         op->n, SPLICE_F_MOVE);
    io_uring_sqe_set_data(sqe, op);
@@ -98,6 +106,8 @@ static socklen_t          s_accept_len = sizeof(s_accept_addr);
 void arm_accept() {
    if (accept_armed) return;
    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+   if (!sqe) { io_uring_submit(&ring); sqe = io_uring_get_sqe(&ring); }
+   if (!sqe) return; // retry next cycle
    io_uring_prep_accept(sqe, listen_fd,
                         (struct sockaddr *)&s_accept_addr, &s_accept_len, 0);
    io_uring_sqe_set_data(sqe, nullptr);
@@ -124,6 +134,8 @@ void async_top_up(std::shared_ptr<BackendServer> backend) {
       op->connect_addr = backend->addr;
 
       struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+      if (!sqe) { io_uring_submit(&ring); sqe = io_uring_get_sqe(&ring); }
+      if (!sqe) { close(fd); delete op; break; }
       io_uring_prep_connect(sqe, fd,
                             reinterpret_cast<sockaddr *>(&op->connect_addr),
                             sizeof(op->connect_addr));
@@ -151,6 +163,10 @@ bool dispatch(int client_fd) {
    conn->backend    = backend;
    pipe(conn->c2b);
    pipe(conn->b2c);
+   // Shrink kernel pipe buffers from the 64 KB default to 4 KB.
+   // Default: 2 pipes × 64 KB × N conns = huge RSS. At 4 KB: 8 KB per conn.
+   fcntl(conn->c2b[0], F_SETPIPE_SZ, 4096);
+   fcntl(conn->b2c[0], F_SETPIPE_SZ, 4096);
 
    Op *c2b = new Op{ OpKind::FILL, conn, client_fd,  backend_fd, conn->c2b[0], conn->c2b[1] };
    Op *b2c = new Op{ OpKind::FILL, conn, backend_fd, client_fd,  conn->b2c[0], conn->b2c[1] };

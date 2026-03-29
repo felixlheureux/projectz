@@ -8,8 +8,8 @@
 #include <chrono>
 #include <map>
 #include <netinet/in.h>
+#include <poll.h>
 #include <string>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -46,11 +46,8 @@ class HealthChecker {
         if (r == 0) {
             ok = true;
         } else if (errno == EINPROGRESS) {
-            fd_set wfds;
-            FD_ZERO(&wfds);
-            FD_SET(fd, &wfds);
-            struct timeval tv{PROBE_TIMEOUT_S, 0};
-            r = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+            struct pollfd pfd{fd, POLLOUT, 0};
+            r = poll(&pfd, 1, PROBE_TIMEOUT_S * 1000);
             if (r == 1) {
                 int err = 0; socklen_t len = sizeof(err);
                 getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);

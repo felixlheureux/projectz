@@ -31,10 +31,10 @@ spec:
           resources:
             requests:
               cpu: "250m"
-              memory: "64Mi"
+              memory: "128Mi"
             limits:
               cpu: "2"
-              memory: "256Mi"
+              memory: "512Mi"
           securityContext:
             # io_uring requires the default seccomp profile to be relaxed.
             # Unconfined is the simplest fix; for production scope it down

@@ -17,6 +17,7 @@ Commands:
   scale  <service> <n>       scale a deployment to n replicas
   keda                       show KEDA scaler status and current replica count
   forward                    start port-forward (localhost:8080 proxy, localhost:9090 metrics)
+  metrics                    live metrics dashboard (refreshes every 2s)
   delete                     delete all projectz resources
 
 Services: lb, ingestion
@@ -99,6 +100,49 @@ cmd_forward() {
   echo "  Metrics: http://localhost:9090/metrics"
 }
 
+cmd_metrics() {
+  command -v curl &>/dev/null || die "curl not found"
+  echo "Live metrics — Ctrl+C to stop (refreshes every 2s)"
+  echo ""
+  # Keep port-forward alive — restart it if the connection drops.
+  _ensure_forward() {
+    curl -sf http://localhost:9090/metrics/json -o /dev/null 2>/dev/null && return
+    pkill -f "kubectl port-forward svc/loadbalancer" 2>/dev/null || true
+    kubectl port-forward svc/loadbalancer 8080:8080 9090:9090 >/dev/null 2>&1 &
+    sleep 1
+  }
+  trap 'pkill -f "kubectl port-forward svc/loadbalancer" 2>/dev/null; exit 0' INT TERM
+  while true; do
+    _ensure_forward
+    local json prom replicas
+    json="$(curl -sf http://localhost:9090/metrics/json 2>/dev/null || echo '{}')"
+    prom="$(curl -sf http://localhost:9090/metrics 2>/dev/null || echo '')"
+    replicas="$(kubectl get deployment ingestion -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo '?')"
+
+    clear
+    echo "═══════════════════════════════════════════════════"
+    echo "  projectz LB  —  $(date '+%H:%M:%S')"
+    echo "═══════════════════════════════════════════════════"
+    printf "  Active connections : %s\n" "$(echo "$json" | grep -o '"lb_active_connections":[0-9]*' | cut -d: -f2)"
+    printf "  Queue depth        : %s\n" "$(echo "$json" | grep -o '"lb_queue_depth":[0-9]*' | cut -d: -f2)"
+    printf "  Connections/s      : %s\n" "$(echo "$prom" | grep '^lb_connections_per_second' | awk '{print $2}')"
+    printf "  Total connections  : %s\n" "$(echo "$prom" | grep '^lb_connections_total' | awk '{print $2}')"
+    printf "  Errors total       : %s\n" "$(echo "$prom" | grep '^lb_errors_total' | awk '{print $2}')"
+    echo ""
+    echo "  Ingestion replicas : $replicas"
+    echo ""
+    echo "  Per-backend connections:"
+    echo "$prom" | grep '^lb_backend_active_connections{' | \
+      sed 's/lb_backend_active_connections{backend="\([^"]*\)"} \(.*\)/    \1  →  \2 active/'
+    echo ""
+    echo "  Per-backend avg latency (ms):"
+    echo "$prom" | grep '^lb_backend_avg_latency_ms{' | \
+      sed 's/lb_backend_avg_latency_ms{backend="\([^"]*\)"} \(.*\)/    \1  →  \2 ms/'
+    echo "═══════════════════════════════════════════════════"
+    sleep 2
+  done
+}
+
 cmd_delete() {
   read -rp "Delete all projectz k8s resources? [y/N] " yn
   [[ "$yn" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
@@ -117,6 +161,7 @@ case "$1" in
   scale)   shift; cmd_scale   "$@" ;;
   keda)    cmd_keda ;;
   forward) cmd_forward ;;
+  metrics) cmd_metrics ;;
   delete)  cmd_delete ;;
   *)       usage ;;
 esac
