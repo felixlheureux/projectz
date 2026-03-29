@@ -16,6 +16,7 @@ pkg/
 .cache/
 compile_commands.json
 services/loadbalancer/loadbalancer
+services/loadbalancer/src/liburing
 
 # Compiled script binaries
 scripts/tcp_spammer

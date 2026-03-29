@@ -7,6 +7,7 @@ export module OperationContext;
 export enum class OpType : uint8_t {
     MULTISHOT_ACCEPT,
     BACKEND_SOCKET_CREATE,
+    BACKEND_SET_LINGER,
     BACKEND_CONNECT_WAIT,
     CLIENT_READ,
     BACKEND_WRITE,

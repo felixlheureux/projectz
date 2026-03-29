@@ -8,8 +8,8 @@
 //   2. Per-thread source IP — each thread binds to a distinct loopback address
 //                      (127.0.0.1, 127.0.0.2, …).  Every IP gives another 64k
 //                      ephemeral ports, multiplying the port budget by N threads.
-//   3. 10 000 concurrent FDs per thread — enough in-flight connections to fully
-//                      pipeline the kernel TCP state machine and reach 250k+ CPS.
+//   3. 4 000 concurrent FDs per thread — scaled across 16 threads to fully
+//                      pipeline the kernel TCP state machine safely in memory.
 //
 // Usage: ./tcp_spammer <duration_seconds> <port>
 
@@ -57,6 +57,7 @@ void worker_thread(int port, int concurrent_connections, int thread_idx) {
         // Bind to the per-thread source IP before connecting so the kernel picks
         // an ephemeral port from the correct IP's range.
         if (bind(fd, reinterpret_cast<sockaddr*>(&src), sizeof(src)) < 0) {
+            std::cerr << "BIND FAILED! Port Exhaustion on IP " << thread_idx << "\n";
             close(fd);
             return;
         }
@@ -108,15 +109,17 @@ int main(int argc, char** argv) {
     if (argc > 1) duration = std::atoi(argv[1]);
     if (argc > 2) port     = std::atoi(argv[2]);
 
-    // Raise the per-process FD limit so 10k connections × N threads don't
-    // exhaust the default 1024-socket limit.  Requires the hard limit to have
+    // Raise the per-process FD limit so 64k concurrent connections don't
+    // exhaust the default 1024-socket limit. Requires the hard limit to have
     // been raised first (make tune / tune_kernel.sh sets it to 1 000 000).
     rlimit rl{1000000, 1000000};
-    setrlimit(RLIMIT_NOFILE, &rl); // best-effort; continues if hard limit is lower
+    setrlimit(RLIMIT_NOFILE, &rl); 
 
-    int threads          = static_cast<int>(std::thread::hardware_concurrency());
-    if (threads < 1) threads = 1;
-    int conns_per_thread = 10000;
+    // [MODIFIED] Force 16 distinct source IPs to bypass the 262k total ephemeral port limit
+    int threads = 16; 
+    
+    // [MODIFIED] 16 threads * 4000 FDs = 64,000 concurrent in-flight connections
+    int conns_per_thread = 4000;
 
     std::vector<std::thread> workers;
     workers.reserve(threads);

@@ -9,6 +9,15 @@ module;
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <liburing.h>
+#include <cerrno>
+
+// SOCKET_URING_OP_GETSOCKOPT/SETSOCKOPT were added in kernel 6.7 / liburing 2.6.
+// The installed liburing-dev 2.5 only defines SIOCINQ=0 and SIOCOUTQ=1.
+// The kernel ABI value is stable, so we define it here for older header sets.
+#ifndef SOCKET_URING_OP_SETSOCKOPT
+#define SOCKET_URING_OP_SETSOCKOPT 3
+#endif
+#include <sys/uio.h>
 #include <sys/mman.h>
 #include <arpa/inet.h>
 
@@ -24,7 +33,8 @@ export class ProxyWorker {
 private:
     static constexpr unsigned RING_DEPTH = 32768;
     static constexpr int BUFFER_SIZE = 4096;
-    static constexpr int BGID = 1; 
+    static constexpr int BGID = 1;
+    static constexpr int MAX_FDS = 65536;
 
     int worker_id_;
     int port_;
@@ -43,6 +53,11 @@ private:
 
     size_t round_robin_index_{0};
 
+    // [FIX 1] Track explicit state to prevent Double-Free socket corruption
+    std::vector<bool> fd_is_open_;
+    // [FIX 2] Buffer closes if the kernel ring is temporarily full
+    std::vector<int> pending_closes_;
+
     OperationContext* acquire_ctx() {
         if (ctx_free_list_.empty()) return nullptr;
         OperationContext* ctx = ctx_free_list_.back();
@@ -54,9 +69,29 @@ private:
         ctx_free_list_.push_back(ctx);
     }
 
+    void flush_pending_closes() noexcept {
+        while (!pending_closes_.empty()) {
+            ::io_uring_sqe* sqe = ring_.get_sqe();
+            if (!sqe) break; // Ring still full, try again next loop
+            
+            int fd = pending_closes_.back();
+            pending_closes_.pop_back();
+            ::io_uring_prep_close_direct(sqe, fd);
+            ::io_uring_sqe_set_data(sqe, nullptr);
+        }
+    }
+
+    ::io_uring_sqe* get_sqe_safe() noexcept {
+        flush_pending_closes();
+        ::io_uring_sqe* sqe = ring_.get_sqe();
+        if (!sqe) {
+            ring_.submit();
+            sqe = ring_.get_sqe();
+        }
+        return sqe;
+    }
+
     sockaddr_in resolve_backend() {
-        // Source/Dest IP Multiplexing to expand 4-tuple space and prevent exhaustion
-        // Generates 127.0.0.1 through 127.0.0.20 as the destination IP
         sockaddr_in dest{};
         dest.sin_family = AF_INET;
         dest.sin_port = htons(8081);
@@ -69,7 +104,7 @@ private:
     }
 
     void submit_multishot_accept() noexcept {
-        ::io_uring_sqe* sqe = ring_.get_sqe();
+        ::io_uring_sqe* sqe = get_sqe_safe();
         if (!sqe) return;
         
         OperationContext* ctx = acquire_ctx();
@@ -77,54 +112,95 @@ private:
         
         ctx->type = OpType::MULTISHOT_ACCEPT;
         
-        // Use direct alloc for zero-overhead socket mapping
         ::io_uring_prep_multishot_accept_direct(sqe, listen_sock_.get_fd(), nullptr, nullptr, 0);
         ::io_uring_sqe_set_data(sqe, ctx);
     }
 
-    // Step 1: Allocate Backend Socket
     void queue_backend_socket(int client_direct_fd) noexcept {
-        ::io_uring_sqe* sqe = ring_.get_sqe();
+        ::io_uring_sqe* sqe = get_sqe_safe();
         if (!sqe) {
-            drop_connection(client_direct_fd, -1);
+            drop_fd(client_direct_fd);
             return;
         }
 
         OperationContext* ctx = acquire_ctx();
-        if (!ctx) { drop_connection(client_direct_fd, -1); return; }
+        if (!ctx) { drop_fd(client_direct_fd); return; }
 
         ctx->type = OpType::BACKEND_SOCKET_CREATE;
         ctx->client_fd_direct = client_direct_fd;
         ctx->backend_fd_direct = -1;
 
-        // Step 1: Allocate Backend Socket
         ::io_uring_prep_socket_direct(sqe, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, IORING_FILE_INDEX_ALLOC, 0);
         ::io_uring_sqe_set_data(sqe, ctx);
     }
 
-    // Step 2: Establish the backend TCP connection
+    void queue_backend_linger(OperationContext* ctx) noexcept {
+        ::io_uring_sqe* sqe = get_sqe_safe();
+        if (!sqe) {
+            drop_fd(ctx->client_fd_direct);
+            drop_fd(ctx->backend_fd_direct);
+            release_ctx(ctx);
+            return;
+        }
+
+        ctx->type = OpType::BACKEND_SET_LINGER;
+
+        // Set SO_LINGER{1,0} on the backend socket via IORING_OP_URING_CMD so that
+        // close() sends RST instead of FIN, skipping the TIME_WAIT state entirely.
+        // io_uring_prep_cmd_sock() in liburing 2.5 is a stub that ignores the
+        // level/optname/optval/optlen args; patch them manually using the stable
+        // kernel UAPI field layout (Linux 6.7+, present in linux/io_uring.h).
+        ::io_uring_prep_cmd_sock(sqe, SOCKET_URING_OP_SETSOCKOPT,
+                                  ctx->backend_fd_direct, 0, 0, nullptr, 0);
+        sqe->flags |= IOSQE_FIXED_FILE;
+
+        // level (SOL_SOCKET=1) and optname (SO_LINGER=13) share sqe->addr as two
+        // consecutive __u32s (lower = level, upper = optname).
+        sqe->addr = static_cast<uint64_t>(SOL_SOCKET) |
+                    (static_cast<uint64_t>(SO_LINGER) << 32);
+
+        // optval pointer → sqe->cmd[0..7] (aliases sqe->addr3 at SQE offset 48).
+        *reinterpret_cast<uint64_t*>(&sqe->cmd[0]) =
+            reinterpret_cast<uint64_t>(&ctx->linger_val);
+
+        // optlen → sqe->cmd[8..11] (SQE offset 56).  The kernel reads optlen from
+        // this exact location for SOCKET_URING_OP_SETSOCKOPT.  Previously this was
+        // incorrectly written to sqe->file_index (offset 44), causing the kernel
+        // to see optlen=0 and silently reject the setsockopt.
+        *reinterpret_cast<uint32_t*>(&sqe->cmd[8]) =
+            static_cast<uint32_t>(sizeof(::linger));
+
+        ::io_uring_sqe_set_data(sqe, ctx);
+    }
+
     void queue_backend_connect(OperationContext* ctx, const sockaddr_in& dest_addr) noexcept {
-        ::io_uring_sqe* sqe_conn = ring_.get_sqe();
+        ::io_uring_sqe* sqe_conn = get_sqe_safe();
         if (!sqe_conn) {
-            drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+            drop_fd(ctx->client_fd_direct);
+            drop_fd(ctx->backend_fd_direct);
+            release_ctx(ctx);
             return;
         }
 
         ctx->type = OpType::BACKEND_CONNECT_WAIT;
 
-        // Execute Connect
         ::io_uring_prep_connect(sqe_conn, ctx->backend_fd_direct, (sockaddr*)&dest_addr, sizeof(dest_addr));
         sqe_conn->flags |= IOSQE_FIXED_FILE;
         ::io_uring_sqe_set_data(sqe_conn, ctx);
     }
 
     void submit_read_request(int fd_direct, int target_fd_direct) noexcept {
-        ::io_uring_sqe* sqe = ring_.get_sqe();
-        if (!sqe) return;
+        ::io_uring_sqe* sqe = get_sqe_safe();
+        if (!sqe) {
+            drop_fd(fd_direct);
+            drop_fd(target_fd_direct);
+            return;
+        }
 
         OperationContext* ctx = acquire_ctx();
         if (!ctx) {
-            drop_connection(fd_direct, target_fd_direct);
+            drop_fd(fd_direct);
+            drop_fd(target_fd_direct);
             return;
         }
 
@@ -139,9 +215,10 @@ private:
     }
 
     void submit_write_request(int target_fd_direct, int source_fd_direct, void* data, unsigned int len, unsigned short buffer_id) noexcept {
-        ::io_uring_sqe* sqe = ring_.get_sqe();
+        ::io_uring_sqe* sqe = get_sqe_safe();
         if (!sqe) {
-            drop_connection(target_fd_direct, source_fd_direct);
+            drop_fd(target_fd_direct);
+            drop_fd(source_fd_direct);
             ::io_uring_buf_ring_add(br_, data, BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(buffers_count_), buffer_id - 1);
             ::io_uring_buf_ring_advance(br_, 1);
             return;
@@ -149,7 +226,8 @@ private:
 
         OperationContext* ctx = acquire_ctx();
         if (!ctx) {
-            drop_connection(target_fd_direct, source_fd_direct);
+            drop_fd(target_fd_direct);
+            drop_fd(source_fd_direct);
             ::io_uring_buf_ring_add(br_, data, BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(buffers_count_), buffer_id - 1);
             ::io_uring_buf_ring_advance(br_, 1);
             return;
@@ -158,35 +236,27 @@ private:
         ctx->type = OpType::BACKEND_WRITE;
         ctx->backend_fd_direct = target_fd_direct; 
         ctx->client_fd_direct = source_fd_direct;  
-        ctx->active_ip_index = buffer_id; // temporarily store buffer ID
+        ctx->active_ip_index = buffer_id;
 
         ::io_uring_prep_send(sqe, target_fd_direct, data, len, 0);
         sqe->flags |= IOSQE_FIXED_FILE;
         ::io_uring_sqe_set_data(sqe, ctx);
     }
 
-    void drop_connection(int fd1_direct, int fd2_direct) noexcept {
-        auto close_fd = [this](int fd_direct) {
-            if (fd_direct < 0) return;
-            ::io_uring_sqe* sqe_close = ring_.get_sqe();
-            
-            if (!sqe_close) {
-                // If the SQ ring is completely full, we must submit to flush it, 
-                // then grab a new SQE to ensure the close command is forced through.
-                ring_.submit(); 
-                sqe_close = ring_.get_sqe();
-                if (!sqe_close) return; // Extreme edge case
-            }
-            
-            ::io_uring_prep_close_direct(sqe_close, fd_direct);
-            
-            // We don't need to track the Completion Queue Entry for a close.
-            // Pass nullptr so we don't consume our ctx_free_list_ pool!
-            ::io_uring_sqe_set_data(sqe_close, nullptr); 
-        };
+    // [FIX 3] Atomic state tracking ensures no Double-Frees and NO LEAKS
+    void drop_fd(int fd_direct) noexcept {
+        if (fd_direct < 0 || fd_direct >= MAX_FDS || !fd_is_open_[fd_direct]) return;
+        
+        fd_is_open_[fd_direct] = false;
 
-        if (fd1_direct >= 0) close_fd(fd1_direct);
-        if (fd2_direct >= 0) close_fd(fd2_direct);
+        ::io_uring_sqe* sqe = ring_.get_sqe();
+        if (sqe) {
+            ::io_uring_prep_close_direct(sqe, fd_direct);
+            ::io_uring_sqe_set_data(sqe, nullptr);
+        } else {
+            // Guarantee resource teardown even during extreme ring congestion
+            pending_closes_.push_back(fd_direct);
+        }
     }
 
 public:
@@ -202,8 +272,9 @@ public:
         (void)max_fds;
         listen_sock_.bind_and_listen(port_);
 
-        // Register direct descriptor sparse table
-        ring_.register_files_sparse(65536);
+        ring_.register_files_sparse(MAX_FDS);
+        fd_is_open_.assign(MAX_FDS, false);
+        pending_closes_.reserve(MAX_FDS);
 
         size_t pool_size = 131072;
         ctx_storage_.resize(pool_size);
@@ -212,7 +283,7 @@ public:
             ctx_free_list_.push_back(&ctx_storage_[i]);
         }
 
-        buffers_count_ = 32768; // Power of 2 required
+        buffers_count_ = 32768; 
         size_t br_size = buffers_count_ * BUFFER_SIZE;
         
         br_ptr_ = ::mmap(NULL, br_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -243,11 +314,8 @@ public:
         submit_multishot_accept();
 
         while (is_running_.load(std::memory_order_acquire)) {
-            // submit and wait for 1 event cooperatively
-            int ret = ring_.submit_and_wait(1);
-            if (ret < 0 && ret != -EBUSY && ret != -EINTR && ret != -ETIME) {
-                // If overflow or fatal error, try to reap anyway
-            }
+            flush_pending_closes();
+            [[maybe_unused]] int ret = ring_.submit_and_wait(1);
 
             while (true) {
                 constexpr unsigned MAX_CQE_BATCH = 4096;
@@ -267,9 +335,9 @@ public:
                     switch (ctx->type) {
                         case OpType::MULTISHOT_ACCEPT:
                             if (res >= 0) {
+                                fd_is_open_[res] = true; // [FIX 1] Claim the FD
                                 queue_backend_socket(res);
                             }
-                            // If IORING_CQE_F_MORE is clear, the multishot accept was terminated
                             if (!(flags & IORING_CQE_F_MORE)) {
                                 release_ctx(ctx);
                                 if (is_running_.load(std::memory_order_relaxed)) {
@@ -280,34 +348,53 @@ public:
 
                         case OpType::BACKEND_SOCKET_CREATE:
                             if (res >= 0) {
-                                ctx->backend_fd_direct = res; // Save direct descriptor
+                                fd_is_open_[res] = true; // [FIX 1] Claim the FD
+                                ctx->backend_fd_direct = res;
+                                // Chain SO_LINGER{1,0} before connecting so the
+                                // kernel skips TIME_WAIT on close, preventing
+                                // nf_conntrack/tcp_max_tw_buckets exhaustion at 262k.
+                                queue_backend_linger(ctx);
+                            } else {
+                                drop_fd(ctx->client_fd_direct);
+                                release_ctx(ctx);
+                            }
+                            break;
+
+                        case OpType::BACKEND_SET_LINGER:
+                            {
+                                // If the async setsockopt failed, the socket will
+                                // close with FIN (TIME_WAIT) instead of RST.  This
+                                // is non-fatal — proceed with connect regardless so
+                                // the proxy keeps functioning, just less efficiently.
+                                if (res < 0) {
+                                    std::cerr << "[Worker " << worker_id_
+                                              << "] BACKEND_SET_LINGER failed: "
+                                              << res << std::endl;
+                                }
                                 sockaddr_in dest = resolve_backend();
                                 queue_backend_connect(ctx, dest);
-                            } else {
-                                drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
-                                release_ctx(ctx); // [FIX] Release on error
                             }
                             break;
 
                         case OpType::BACKEND_CONNECT_WAIT:
                             if (res == 0) {
-                                // Phase 2: Connect completed successfully
                                 submit_read_request(ctx->client_fd_direct, ctx->backend_fd_direct);
                                 submit_read_request(ctx->backend_fd_direct, ctx->client_fd_direct);
                             } else {
-                                drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+                                drop_fd(ctx->client_fd_direct);
+                                drop_fd(ctx->backend_fd_direct);
                             }
-                            release_ctx(ctx); // [FIX] The connect phase is over. Free the context.
+                            release_ctx(ctx);
                             break;
 
                         case OpType::CLIENT_READ:
                             if (res > 0) {
                                 unsigned short buffer_id = flags >> IORING_CQE_BUFFER_SHIFT;
                                 char* buf_addr = static_cast<char*>(br_ptr_) + ((buffer_id - 1) * BUFFER_SIZE);
-                                // Send data to destination
                                 submit_write_request(ctx->backend_fd_direct, ctx->client_fd_direct, buf_addr, res, buffer_id);
                             } else if (res <= 0) {
-                                drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+                                drop_fd(ctx->client_fd_direct);
+                                drop_fd(ctx->backend_fd_direct);
                             }
                             
                             if (!(flags & IORING_CQE_F_MORE)) {
@@ -319,16 +406,17 @@ public:
                             {
                                 unsigned short buffer_id = ctx->active_ip_index;
                                 char* buf_addr = static_cast<char*>(br_ptr_) + ((buffer_id - 1) * BUFFER_SIZE);
-                                // Restore buffer to ring
                                 ::io_uring_buf_ring_add(br_, buf_addr, BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(buffers_count_), buffer_id - 1);
                                 ::io_uring_buf_ring_advance(br_, 1);
                                 
                                 if (res < 0) {
-                                    drop_connection(ctx->client_fd_direct, ctx->backend_fd_direct);
+                                    drop_fd(ctx->client_fd_direct);
+                                    drop_fd(ctx->backend_fd_direct);
                                 }
                                 release_ctx(ctx);
                             }
                             break;
+
                         case OpType::CLOSE_CONNECTION:
                             release_ctx(ctx);
                             break;
