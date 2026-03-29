@@ -9,36 +9,10 @@ A high-performance, distributed data ingestion system designed to process high-t
 **Core Stack:**
 
 - **Edge Agents (Rust):** Absolute memory safety and microscopic footprint for constrained embedded environments.
-- **Layer 4 Load Balancer (C++):** Bare-metal network routing utilizing advanced `io_uring` topologies (Direct Descriptors, Linked SQEs, Buffer Rings) and strict modern C++ idioms.
+- **Layer 4 Load Balancer (C++):** Bare-metal network routing utilizing advanced `io_uring` topologies (Direct Descriptors, Linked SQEs, Buffer Rings).
 - **Cloud Infrastructure (Go):** Massive network concurrency and scalable backend services with zero-allocation memory pools.
 - **Deployment:** Kubernetes (Docker/containerd), designed for an Ubuntu Linux host environment.
 - **Architecture:** Monorepo.
-
----
-
-## 2. Monorepo Structure
-
-The repository is structured to manage three distinct build toolchains (Cargo, CMake, and Go Modules) while keeping protocol definitions synchronized.
-
-```text
-projectz/
-├── agent/                 # Rust: Edge device data producers
-│   ├── Cargo.toml
-│   └── src/
-├── core/                   # Shared Schemas: Protocol Buffers definitions
-│   └── proto/              # .proto files used to generate Rust, C++, and Go bindings
-├── services/
-│   ├── loadbalancer/      # C++: Custom Layer 4 TCP/UDP proxy (io_uring)
-│   │   ├── CMakeLists.txt
-│   │   └── src/
-│   ├── ingester/           # Go: API for receiving and validating edge payloads
-│   ├── broker/             # Go: In-memory message queue with Dead Letter Queue (DLQ)
-│   └── tsdb/               # Go: Custom time-series database storage engine
-├── infrastructure/
-│   ├── docker/             # Dockerfiles (multi-stage builds for Rust, C++, Go)
-│   └── k8s/                # Kubernetes manifests (Deployments, Services, ConfigMaps)
-└── scripts/                # Build automation (Cross-compiling Apple Silicon -> Linux)
-```
 
 ---
 
@@ -49,21 +23,6 @@ projectz/
 - **Implementation:** Rust.
 - **Function:** Runs as a lightweight daemon alongside remote orchestration tools to collect hardware and system telemetry.
 - **Behavior:** Batches data points and a cryptographic identity token into a compact binary format (Protocol Buffers). Manages a persistent, asynchronous TCP connection to the cloud balancer using `tokio`. Retains the payload buffer in local memory until an explicit application-layer acknowledgment (ACK) is received from the backend, utilizing exponential backoff for retries.
-
-### Step 2: Layer 4 Load Balancer (The Front Door)
-
-- **Implementation:** Modern C++ (C++23).
-- **Kubernetes Role:** Exposed as a `LoadBalancer` or `NodePort` Service.
-- **Function:** The high-speed traffic proxy. Accepts incoming edge connections, multiplexes bidirectional traffic, and routes transport-layer packets to backend pods entirely within the kernel context.
-- **Behavior & Systems Engineering Standards:** Operates strictly at the transport layer, utilizing advanced `io_uring` orchestration to achieve a zero-context-switch architecture, expressly disabling `SQPOLL` to prevent interrupt cache-thrashing.
-  - **Modern Ring Topology:** Initializes the ring with `IORING_SETUP_SINGLE_ISSUER`, `IORING_SETUP_DEFER_TASKRUN`, and `IORING_SETUP_COOP_TASKRUN`. This forces the kernel to bypass internal mutexes and defers all `task_work` processing to the synchronous `io_uring_submit_and_wait` boundary, eliminating destructive Inter-Processor Interrupts (IPIs).
-  - **VFS Lock Bypass via Direct Descriptors:** Abandons the global file descriptor table (which suffers severe spinlock contention). Registers a sparse file table (`io_uring_register_files_sparse`) and utilizes `IORING_FILE_INDEX_ALLOC` alongside `IORING_OP_SOCKET` to allocate sockets completely asynchronously.
-  - **Atomic Backend Routing (Linked SQEs):** Submits chained operations via `IOSQE_IO_LINK`. A single batch submission natively creates the direct socket (`IORING_OP_SOCKET`), configures it (`IORING_OP_URING_CMD` for `SOCKET_URING_OP_SETSOCKOPT`), and establishes the connection (`IORING_OP_CONNECT`). If one fails, the chain aborts securely without returning to userspace.
-  - **Ring-Mapped Provided Buffers:** Deprecates static memory slabs in favor of `io_uring_setup_buf_ring`. Memory is leased dynamically to sockets exclusively upon physical packet arrival. The buffer ring is backed by `mmap` with `MAP_HUGETLB` (hugepages) to eliminate Translation Lookaside Buffer (TLB) misses during DMA transfers.
-  - **Asymmetric Overflow Mitigation:** Sizing the Completion Queue (e.g., 32,768) asymmetrically larger than the Submission Queue (e.g., 8,192). The event loop explicitly monitors for `IORING_SQ_CQ_OVERFLOW` to drain the `cq_overflow_list` dynamically under heavy multishot accept bursts.
-  - **Ephemeral Port Exhaustion Defenses:** Overcomes the mathematical limits of the 64,500 ephemeral port limit via two mechanisms:
-    1.  **Loopback IP Multiplexing:** Outbound proxy connections round-robin their bind addresses across the `127.0.0.0/8` subnet (e.g., `127.0.0.2` to `127.0.0.20`), scaling the 4-tuple space to millions of available combinations.
-    2.  **`SO_LINGER` Active Resets:** Abandons graceful `FIN` states. Embeds `SO_LINGER` (linger=0) via an asynchronous `URING_CMD` prior to closure, forcing the TCP stack to transmit an `RST` packet. This instantly evicts the connection from `conntrack`, entirely bypassing the 60-second `TIME_WAIT` penalty.
 
 ### Step 3: Ingestion Pods (The Processors)
 

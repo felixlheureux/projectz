@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadbalancer
+  labels:
+    app: loadbalancer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loadbalancer
+  template:
+    metadata:
+      labels:
+        app: loadbalancer
+    spec:
+      containers:
+        - name: loadbalancer
+          image: projectz/loadbalancer:latest
+          imagePullPolicy: IfNotPresent
+          # args: <port> <backend_host> <backend_port> [...]
+          # "ingestion" resolves to the ClusterIP of the ingestion Service
+          args: ["8080", "9090", "8081"]
+          ports:
+            - containerPort: 8080
+              name: proxy
+            - containerPort: 9090
+              name: metrics
+            - containerPort: 8081
+              name: control
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "64Mi"
+            limits:
+              cpu: "2"
+              memory: "256Mi"
+          securityContext:
+            # io_uring requires the default seccomp profile to be relaxed.
+            # Unconfined is the simplest fix; for production scope it down
+            # to a custom profile that allows io_uring_setup/enter/register.
+            seccompProfile:
+              type: Unconfined
+            # CAP_SYS_NICE is required for IORING_SETUP_SQPOLL (kernel SQ poll thread).
+            # The LB falls back to normal io_uring if this capability is absent.
+            capabilities:
+              add: ["SYS_NICE"]

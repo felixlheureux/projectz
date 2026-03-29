@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package projectz.telemetry.v1;
+
+// Generated Go code lands at projectz/core/telemetry/v1 (relative to module root).
+option go_package = "projectz/core/telemetry/v1";
+
+// ─── TelemetryBatch ───────────────────────────────────────────────────────────
+//
+// The main envelope transmitted by the Rust edge agent over a persistent TCP
+// connection through the C++ load balancer to the Go ingestion pods.
+//
+// Delivery guarantee: the edge agent retains this batch in memory and retries
+// with exponential backoff until it receives an IngestResponse whose sequence
+// matches this batch's sequence.
+
+message TelemetryBatch {
+  // Stable identifier burned into the device at provisioning time.
+  string device_id = 1;
+
+  // Monotonically increasing per-device counter. Used by the broker for
+  // deduplication and by the edge agent to correlate ACKs.
+  uint64 sequence = 2;
+
+  // Batch creation time in microseconds since the Unix epoch.
+  // Microsecond precision is required by the SSTable time-partitioning in the
+  // storage layer — second-level granularity is insufficient.
+  int64 timestamp_us = 3;
+
+  // One or more metric readings sampled during this collection interval.
+  repeated Metric metrics = 4;
+
+  // Ed25519 signature over the canonical protobuf serialization of fields 1–4.
+  // Produced by the edge agent's device private key.
+  // The ingestion pod validates this against the device's registered public key
+  // before enqueuing the batch. Failure routes to the DLQ.
+  bytes signature = 5;
+}
+
+// ─── Metric ───────────────────────────────────────────────────────────────────
+
+message Metric {
+  // Integer wire representation saves bandwidth vs string type names.
+  enum Type {
+    UNKNOWN              = 0;
+    CPU_USAGE_PERCENT    = 1;
+    MEMORY_USAGE_BYTES   = 2;
+    MEMORY_TOTAL_BYTES   = 3;
+    CPU_TEMP_CELSIUS     = 4;
+    NETWORK_TX_BYTES     = 5;
+    NETWORK_RX_BYTES     = 6;
+    DISK_READ_BYTES      = 7;
+    DISK_WRITE_BYTES     = 8;
+    DISK_USAGE_BYTES     = 9;
+    DISK_TOTAL_BYTES     = 10;
+  }
+
+  Type type = 1;
+
+  // double covers all sensor ranges (temperatures, byte counts, percentages)
+  // without precision loss.
+  double value = 2;
+
+  // Dimension labels for sub-device granularity.
+  // Examples: {"cpu": "0"} {"interface": "eth0"} {"disk": "sda"}
+  // Allows the storage layer to distinguish per-core, per-interface, per-disk
+  // readings of the same MetricType without schema changes.
+  map<string, string> labels = 3;
+}
+
+// ─── IngestResponse ───────────────────────────────────────────────────────────
+//
+// ACK sent back by the ingestion pod through the load balancer to the edge
+// agent after the batch has been validated and successfully inserted into the
+// broker queue.
+
+message IngestResponse {
+  // Echoes the batch's device_id — guards against misdirected responses on a
+  // multiplexed connection.
+  string device_id = 1;
+
+  // Echoes the batch's sequence so the agent can release that batch from its
+  // retry buffer.
+  uint64 sequence = 2;
+
+  // False if Ed25519 validation failed, the payload is malformed, or the
+  // broker queue is full (backpressure).
+  bool success = 3;
+
+  // Human-readable failure reason. Empty when success is true.
+  string error_message = 4;
+}

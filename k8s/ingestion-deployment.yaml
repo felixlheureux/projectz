@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion
+  labels:
+    app: ingestion
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ingestion
+  template:
+    metadata:
+      labels:
+        app: ingestion
+    spec:
+      containers:
+        - name: ingestion
+          image: projectz/ingestion:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6000
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: LB_CONTROL_URL
+              value: "http://loadbalancer-control:8081"
+          lifecycle:
+            preStop:
+              exec:
+                # give in-flight connections a moment to drain
+                command: ["sleep", "5"]
+          readinessProbe:
+            tcpSocket:
+              port: 6000
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"

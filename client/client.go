@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const addr = "0.0.0.0:5001"
+const addr = "localhost:8080"
 
 func main() {
 	for {

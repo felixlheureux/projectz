@@ -18,4 +18,5 @@ set(SOURCES
 
 # 6. Create the executable from those source files
 add_executable(loadbalancer ${SOURCES})
-target_link_libraries(loadbalancer uring)
+find_package(Threads REQUIRED)
+target_link_libraries(loadbalancer uring Threads::Threads)

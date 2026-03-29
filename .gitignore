@@ -1,11 +1,11 @@
-# Monorepo Build Directories
+# ─── Build outputs ───────────────────────────────────────────────────────────
 build/
 build_*/
 _deps/
 target/
 bin/
 
-# Compiled object files, caches, and executables
+# ─── C++ artifacts ───────────────────────────────────────────────────────────
 *.o
 *.pcm
 *.so
@@ -17,16 +17,29 @@ compile_commands.json
 services/loadbalancer/loadbalancer
 services/loadbalancer/src/liburing
 
-# Compiled script binaries
+# ─── Script binaries ─────────────────────────────────────────────────────────
 scripts/tcp_spammer
 scripts/tcp_sink
 
-# Scratch or temporary files
-test.cpp
-load_test_results/
+# ─── Go ──────────────────────────────────────────────────────────────────────
+# go.sum and *.pb.go are intentionally committed:
+# go.sum ensures reproducible builds, *.pb.go lets consumers skip protoc.
 
-# Editors and OS
+# ─── Kubernetes / local dev ──────────────────────────────────────────────────
+*.pid
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+.docker/
+
+# ─── Editors and OS ──────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
+*.swo
 .DS_Store
+
+# ─── Scratch ─────────────────────────────────────────────────────────────────
+*.local
+test.cpp
+load_test_results/
+p.md

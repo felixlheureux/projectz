@@ -10,4 +10,4 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 run: build
-	cd $(BUILD_DIR) && ./loadbalancer 5001 192.168.5.2 6000
+	cd $(BUILD_DIR) && ./loadbalancer 8080 9090 8081 192.168.5.2 6000
