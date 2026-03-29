@@ -52,8 +52,21 @@ run-release: release
 	./build_release/loadbalancer
 
 # 9. Install build dependencies (run once on a fresh machine)
+#    The Ubuntu 24.04 apt package (liburing-dev 2.5) ships a STUB
+#    io_uring_prep_cmd_sock that discards level/optname/optval/optlen.
+#    We MUST compile from upstream to get full SOCKET_URING_OP_SETSOCKOPT
+#    support required for the async SO_LINGER bypass.
 setup:
-	sudo apt-get install -y liburing-dev
+	@echo "[setup] Removing stale apt liburing packages..."
+	sudo apt-get remove -y liburing-dev liburing2 2>/dev/null || true
+	@echo "[setup] Cloning upstream liburing..."
+	rm -rf /tmp/liburing-upstream
+	git clone --depth 1 https://github.com/axboe/liburing.git /tmp/liburing-upstream
+	@echo "[setup] Building and installing upstream liburing..."
+	cd /tmp/liburing-upstream && ./configure && make -C src -j$$(nproc)
+	cd /tmp/liburing-upstream && sudo make install
+	sudo ldconfig
+	@echo "[setup] Done.  Verify: pkg-config --modversion liburing"
 
 # 10. Apply kernel tuning (requires sudo)
 tune:
