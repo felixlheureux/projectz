@@ -4,7 +4,6 @@ build_*/
 _deps/
 target/
 bin/
-pkg/
 
 # Compiled object files, caches, and executables
 *.o
