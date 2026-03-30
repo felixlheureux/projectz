@@ -1,0 +1,47 @@
+[Unit]
+Description=projectz Layer 4 Load Balancer
+Documentation=https://github.com/felixlheureux/projectz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Args: <proxy_port> <metrics_port> <control_port>
+# Backends register themselves via the control endpoint at runtime.
+ExecStart=/usr/local/bin/loadbalancer 8080 9090 8081
+Restart=on-failure
+RestartSec=2s
+# Give in-flight connections time to drain on SIGTERM before SIGKILL.
+TimeoutStopSec=30s
+
+# ── File descriptors ──────────────────────────────────────────────────────────
+# 100k connections × 6 fds each = 600k fds minimum.
+LimitNOFILE=1000000
+
+# ── Memory lock ───────────────────────────────────────────────────────────────
+# io_uring pins memory pages in kernel space (IORING_REGISTER_BUFFERS).
+# Requires unlimited memlock to avoid -ENOMEM on ring setup.
+LimitMEMLOCK=infinity
+
+# ── Capabilities ──────────────────────────────────────────────────────────────
+# CAP_SYS_NICE: required for IORING_SETUP_SQPOLL (kernel SQ poll thread).
+# No other capabilities are needed — drop everything else.
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+NoNewPrivileges=true
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+# Allow binding to ports < 1024 if needed (e.g. port 443).
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=projectz-lb
+
+[Install]
+WantedBy=multi-user.target

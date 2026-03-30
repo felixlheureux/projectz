@@ -1,0 +1,23 @@
+# Calico BGP peer — bare metal LB node
+#
+# This tells Calico to peer with the LB node over BGP so that pod CIDRs
+# (e.g. 10.244.0.0/16) are announced into the LB node's routing table.
+# The LB can then connect directly to pod IPs without NAT or kube-proxy.
+#
+# Prerequisites:
+#   - Calico installed with BGP enabled (not VXLAN-only mode)
+#   - Bird/FRRouting running on the LB node accepting BGP sessions
+#   - Replace LB_NODE_IP with the bare metal LB node's IP
+#
+# Apply: kubectl apply -f deploy/calico/bgp-peer.yaml
+# Verify: kubectl exec -n kube-system calico-node-<pod> -- birdcl show protocols
+
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: projectz-lb-node
+spec:
+  # IP of the bare metal node running the C++ LB.
+  peerIP: LB_NODE_IP
+  # Standard BGP AS number — use your own private ASN (64512–65534).
+  asNumber: 64512
