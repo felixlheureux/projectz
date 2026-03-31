@@ -1,6 +1,6 @@
 # Projectz: Polyglot Edge-to-Cloud Telemetry Pipeline
 
-## Architecture Specification v0.4
+## Architecture Specification v0.5
 
 ---
 
@@ -10,14 +10,14 @@ Projectz is a high-throughput distributed telemetry pipeline. Remote edge device
 
 The architecture is polyglot by design. Each component is implemented in the language whose strengths match that component's constraints:
 
-| Component | Language | Why |
-|---|---|---|
-| Edge Agents | Rust | Memory safety, zero runtime overhead, tiny binary for constrained devices |
-| Layer 4 Load Balancer | C++ | Direct `io_uring` access, kernel-level network I/O, zero-copy routing |
-| Ingestion Pods | Go | Goroutine-per-connection concurrency, rapid prototyping, rich stdlib |
-| Message Broker (Queue + DLQ) | Rust | Cache-line-aligned lock-free data structures, zero GC, deterministic latency |
-| Time-Series Storage Engine | Go | High concurrency for read/write replicas, ergonomic disk I/O |
-| Telemetry Dashboard | Go + React | REST API over stored data, browser-based visualization for end users |
+| Component                    | Language   | Why                                                                          |
+| ---------------------------- | ---------- | ---------------------------------------------------------------------------- |
+| Edge Agents                  | Rust       | Memory safety, zero runtime overhead, tiny binary for constrained devices    |
+| Layer 4 Load Balancer        | C++        | Direct `io_uring` access, kernel-level network I/O, zero-copy routing        |
+| Ingestion Pods               | Go         | Goroutine-per-connection concurrency, rapid prototyping, rich stdlib         |
+| Message Broker (Queue + DLQ) | Rust       | Cache-line-aligned lock-free data structures, zero GC, deterministic latency |
+| Time-Series Storage Engine   | Go         | High concurrency for read/write replicas, ergonomic disk I/O                 |
+| Telemetry Dashboard          | Go + React | REST API over stored data, browser-based visualization for end users         |
 
 The repository is a monorepo. The deployment target is Kubernetes on Ubuntu Linux.
 
@@ -75,7 +75,7 @@ Message Broker (Rust, StatefulSet)
 
 **Behavior:**
 
-The agent batches telemetry data points into a Protobuf envelope. Each envelope includes a cryptographic identity token (Ed25519 signature over the payload) so the backend can verify both the sender's identity and data integrity without relying on transport-layer trust.
+The agent batches telemetry data points into a Protobuf envelope. Each envelope includes a cryptographic identity token (Ed25519 signature over the payload) so the backend can verify both the sender's identity and data integrity without relying on transport-layer trust. Each envelope also carries a **priority field** — routine metrics (periodic temperature readings, heartbeats) are tagged `NORMAL`, while threshold breaches, error conditions, and anomaly detections are tagged `CRITICAL`. The priority assignment is configured per-metric on the agent and is part of the signed payload, so it cannot be tampered with in transit.
 
 The agent maintains a persistent asynchronous TCP connection to the cloud load balancer via `tokio`. Payloads are retained in a local memory buffer until an explicit application-layer ACK is received from the ingestion pod. If no ACK arrives within a deadline, the agent retries with exponential backoff. This is the foundational guarantee against data loss — the edge device never discards data it hasn't been told was received.
 
@@ -117,6 +117,10 @@ In either case, the C++ proxy itself never touches a TLS handshake.
 **Zero-allocation decoding:** Incoming Protobuf payloads are decoded into pre-allocated structs recycled via `sync.Pool`. At 250k ops/second, heap allocation thrashing would produce GC latency spikes. The pool eliminates this — structs are borrowed, populated, forwarded, and returned. No new allocations on the hot path.
 
 **Authentication:** Each Protobuf envelope embeds an Ed25519 token. The ingester performs in-memory signature verification. This is deliberately lightweight — no certificate chain traversal, no revocation checks, no external auth service calls. A single Ed25519 verify is ~70μs. Invalid signatures route the payload to the poison queue via the broker.
+
+**Pre-aggregation:** Raw telemetry at full device reporting rate is too granular for the storage engine. If a device reports CPU temperature 100 times per second, the DB doesn't need 100 rows — it needs one row per interval containing min, max, mean, and count. The ingester aggregates validated payloads in-memory over a configurable time window (default: 1 second) per device per metric, then pushes a single aggregated payload to the broker. This reduces write volume by orders of magnitude without losing meaningful signal. `CRITICAL` priority payloads bypass aggregation entirely and are forwarded immediately — you never want to delay an alert.
+
+**Adaptive sampling:** The broker periodically reports shard saturation (current depth / capacity) in its `InsertionAck` responses. When saturation exceeds a high watermark (e.g., 80%), the ingester enters degraded mode: the aggregation window widens (e.g., from 1s to 5s), and `NORMAL` payloads may be sampled (keep every Nth data point). When saturation drops below a low watermark (e.g., 50%), the ingester returns to full resolution. The edge agents are unaware of this — they keep sending at full rate, and still receive ACKs. The thinning happens entirely inside the ingester. This is the system's primary defense against sustained overproduction.
 
 **ACK flow:**
 
@@ -190,13 +194,35 @@ struct ConsumerState {
 
 **Memory ordering:** The producer writes data to the slot, then advances `head` with `Release` ordering. The consumer reads `head` with `Acquire` ordering before reading the slot. This guarantees the consumer always sees the fully written payload — never a half-written struct. No `SeqCst` (sequentially consistent) ordering is needed, which avoids a full memory fence on every operation.
 
-#### 3.4.2 Overflow Policy: Backpressure
+#### 3.4.2 Flow Control Strategy (Three Layers)
 
-When a shard's ring buffer is full, the producer blocks. The ingester's gRPC call stalls. No ACK is sent to the edge agent. The edge agent retries with exponential backoff.
+A queue is a burst absorber, not a rate mismatch solution. If sustained production permanently exceeds the DB's write throughput, the ring buffers fill and the entire pipeline stalls. The system addresses this with three complementary mechanisms, listed from always-on to last-resort:
 
-This is the correct design for a telemetry pipeline where data loss is unacceptable. The system slows down gracefully under saturation rather than dropping data. Latency increases, throughput holds.
+**Layer 1 — Pre-aggregation (always on, at the ingester):**
 
-The alternative (dropping oldest entries) would require the edge agent to somehow learn that previously ACK'd data was discarded — a much harder problem that introduces eventual consistency concerns with no upside for time-series telemetry.
+Described in Section 3.3. The ingester aggregates raw telemetry into per-second (or configurable interval) summaries before pushing to the broker. This is the single largest throughput reduction — 100 data points per device per second become 1 aggregated row. It runs unconditionally, regardless of system pressure.
+
+**Layer 2 — Adaptive sampling (dynamic, triggered by shard saturation):**
+
+The broker includes its current shard saturation percentage in every `InsertionAck` response. The ingester monitors this value:
+
+- **Saturation > 80% (high watermark):** Ingester enters degraded mode. Aggregation window widens (1s → 5s → 15s). `NORMAL` payloads may be further downsampled (keep every Nth point). `CRITICAL` payloads are always forwarded immediately at full fidelity.
+- **Saturation < 50% (low watermark):** Ingester returns to normal mode. Full resolution resumes.
+
+The hysteresis gap between 80% and 50% prevents rapid oscillation between modes. Edge agents are completely unaware of adaptive sampling — they continue sending at full rate and receiving ACKs. The thinning is invisible to the producer.
+
+**Layer 3 — Priority-aware shedding (last resort, at the broker):**
+
+If adaptive sampling is insufficient and a shard reaches 100% capacity, the broker must decide what to do. Rather than blocking all producers equally (the original backpressure-only design), the broker uses the priority field embedded in each payload:
+
+- **`CRITICAL` payloads:** Always accepted. If the ring is full, the broker evicts the oldest `NORMAL` payload to make room. Critical data — threshold breaches, error conditions, anomalies — is never shed.
+- **`NORMAL` payloads:** Blocked (backpressure). The ingester's gRPC call stalls, no ACK is sent to the edge agent, and the agent retries with exponential backoff.
+
+This means that under extreme sustained pressure, the system degrades gracefully: routine metrics slow down and may develop gaps, but critical alerts always flow through in real time. The edge agent's retry mechanism guarantees that once pressure subsides, `NORMAL` payloads eventually catch up — data is delayed, not lost.
+
+**Why three layers instead of just backpressure:**
+
+Backpressure alone (the original design) is correct but blunt. It treats all data equally and causes the entire pipeline to stall, including critical alerts, the moment any shard fills up. The three-layer approach means the system exhausts cheap options first (aggregation is free, sampling is nearly free) before resorting to blocking producers, and even when it blocks, it protects the data that matters most.
 
 #### 3.4.3 gRPC Interface
 
@@ -207,8 +233,39 @@ The alternative (dropping oldest entries) would require the edge agent to someho
 **Proto contract (indicative):**
 
 ```protobuf
+enum Priority {
+  NORMAL = 0;
+  CRITICAL = 1;
+}
+
+message TelemetryPayload {
+  string agent_id = 1;
+  int64 timestamp_ns = 2;
+  Priority priority = 3;
+  bytes ed25519_signature = 4;
+  repeated MetricPoint metrics = 5;
+}
+
+message MetricPoint {
+  string name = 1;
+  double value = 2;
+  // Present only in aggregated payloads (from ingester pre-aggregation)
+  optional double min = 3;
+  optional double max = 4;
+  optional double mean = 5;
+  optional uint32 count = 6;
+}
+
+message InsertionAck {
+  uint64 sequence_id = 1;
+  bool accepted = 2;
+  // Broker reports shard pressure so ingesters can adapt
+  float shard_saturation_pct = 3;
+}
+
 service Broker {
   // Ingesters push validated payloads, receive insertion confirmations
+  // with shard saturation feedback for adaptive sampling
   rpc Ingest(stream TelemetryPayload) returns (stream InsertionAck);
 
   // Storage workers pull batches for writing
@@ -277,13 +334,13 @@ This component has two parts: a Go REST API that queries the storage engine's re
 
 **Endpoints (indicative):**
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/v1/devices` | GET | List all known edge agents (derived from agent IDs in stored payloads) |
-| `/api/v1/devices/{id}/telemetry` | GET | Time-range query for a specific device. Params: `start`, `end`, `interval` (downsampling bucket) |
-| `/api/v1/devices/{id}/latest` | GET | Most recent telemetry payload for a device (live view) |
-| `/api/v1/fleet/summary` | GET | Aggregate fleet stats: active device count, total events ingested, error rates |
-| `/api/v1/health` | GET | API health check (storage connectivity, read replica lag) |
+| Endpoint                         | Method | Description                                                                                      |
+| -------------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
+| `/api/v1/devices`                | GET    | List all known edge agents (derived from agent IDs in stored payloads)                           |
+| `/api/v1/devices/{id}/telemetry` | GET    | Time-range query for a specific device. Params: `start`, `end`, `interval` (downsampling bucket) |
+| `/api/v1/devices/{id}/latest`    | GET    | Most recent telemetry payload for a device (live view)                                           |
+| `/api/v1/fleet/summary`          | GET    | Aggregate fleet stats: active device count, total events ingested, error rates                   |
+| `/api/v1/health`                 | GET    | API health check (storage connectivity, read replica lag)                                        |
 
 **Downsampling:** Raw telemetry at 250k events/second is far too granular for a dashboard. The API supports an `interval` parameter (e.g., `1m`, `5m`, `1h`) that buckets data points and returns aggregates (min, max, mean, count) per interval. This is computed at query time by scanning the relevant SSTables and aggregating in memory. For frequently accessed time ranges, a caching layer (in-memory LRU or Redis) can reduce redundant scans.
 
@@ -378,16 +435,16 @@ Development is on ARM64 (Apple Silicon). Production targets are `x86_64-unknown-
 
 ### 6.3 Kubernetes Resources
 
-| Component | Resource Type | Replicas | Storage |
-|---|---|---|---|
-| L4 Load Balancer | `DaemonSet` or dedicated node | 1 (pinned) | None |
-| Ingestion Pods | `Deployment` | 3-5 (HPA) | None |
-| Message Broker | `StatefulSet` | 1-3 | Ephemeral (ring buffers are in-memory) |
-| Storage Engine (write) | `StatefulSet` | 1 | PVC → host block storage |
-| Storage Engine (read) | `StatefulSet` | 1-2 | PVC → replicated SSTables |
-| Telemetry Dashboard | `Deployment` | 1-2 | None (stateless) |
-| Prometheus | `StatefulSet` | 1 | PVC (15-day metric retention) |
-| Grafana | `Deployment` | 1 | ConfigMap (provisioned dashboards) |
+| Component              | Resource Type                 | Replicas   | Storage                                |
+| ---------------------- | ----------------------------- | ---------- | -------------------------------------- |
+| L4 Load Balancer       | `DaemonSet` or dedicated node | 1 (pinned) | None                                   |
+| Ingestion Pods         | `Deployment`                  | 3-5 (HPA)  | None                                   |
+| Message Broker         | `StatefulSet`                 | 1-3        | Ephemeral (ring buffers are in-memory) |
+| Storage Engine (write) | `StatefulSet`                 | 1          | PVC → host block storage               |
+| Storage Engine (read)  | `StatefulSet`                 | 1-2        | PVC → replicated SSTables              |
+| Telemetry Dashboard    | `Deployment`                  | 1-2        | None (stateless)                       |
+| Prometheus             | `StatefulSet`                 | 1          | PVC (15-day metric retention)          |
+| Grafana                | `Deployment`                  | 1          | ConfigMap (provisioned dashboards)     |
 
 ---
 
@@ -400,21 +457,25 @@ At 250,000 concurrent connections, the default Linux kernel parameters are insuf
 ```
 fs.file-max = 1000000
 ```
+
 System-wide ceiling on open file descriptors. The default (~65k) is exhausted almost immediately at target load.
 
 ```
 net.core.somaxconn = 65535
 ```
+
 Maximum backlog for listening sockets. When a SYN arrives faster than `accept()` can drain the queue, excess connections are dropped. This raises the ceiling.
 
 ```
 net.ipv4.tcp_max_syn_backlog = 65535
 ```
+
 Kernel queue depth for half-open TCP connections (SYN received, SYN-ACK sent, waiting for final ACK). Under SYN flood or burst traffic, this prevents silent drops.
 
 ```
 net.ipv4.ip_local_port_range = 1024 65535
 ```
+
 Ephemeral port range for outbound connections. The proxy opens connections to backend pods — each one consumes a port. The default range (~28k ports) limits outbound concurrency.
 
 ### 7.2 Memory and Hugepages
@@ -422,6 +483,7 @@ Ephemeral port range for outbound connections. The proxy opens connections to ba
 ```
 vm.nr_hugepages = 1024
 ```
+
 Pre-allocates 1024 × 2MB hugepages. The `io_uring` buffer rings (`io_uring_setup_buf_ring`) map these pages for packet reception buffers. Hugepages reduce TLB (Translation Lookaside Buffer) cache misses — each TLB entry covers 2MB instead of 4KB, meaning fewer page table walks during high-throughput I/O.
 
 **RLIMIT_MEMLOCK:** The proxy container must run with `memlock` privileges (`ulimit -l unlimited`) so `io_uring` can pin buffer memory in kernel space without hitting the default per-process lock limit.
@@ -463,10 +525,10 @@ Each component exposes a `/metrics` HTTP endpoint in Prometheus exposition forma
 
 **Kubernetes resources:**
 
-| Component | Resource Type | Storage |
-|---|---|---|
+| Component  | Resource Type | Storage                                  |
+| ---------- | ------------- | ---------------------------------------- |
 | Prometheus | `StatefulSet` | PVC (metrics retention, default 15 days) |
-| Grafana | `Deployment` | ConfigMap (dashboard JSON provisioning) |
+| Grafana    | `Deployment`  | ConfigMap (dashboard JSON provisioning)  |
 
 ### 8.2 Metrics Per Component
 
@@ -474,71 +536,78 @@ Each component exposes a `/metrics` HTTP endpoint in Prometheus exposition forma
 
 Exposed via the `prometheus` crate with a lightweight Hyper HTTP server on a dedicated port.
 
-| Metric | Type | What It Tells You |
-|---|---|---|
-| `edge_payloads_sent_total` | Counter | Total payloads transmitted to the cloud |
-| `edge_acks_received_total` | Counter | Total ACKs received (delta with sent = in-flight) |
-| `edge_retries_total` | Counter | Retry count (sustained increase = downstream problem) |
-| `edge_payload_batch_size` | Histogram | Distribution of batch sizes (tuning signal) |
-| `edge_send_latency_seconds` | Histogram | Round-trip time from send to ACK |
-| `edge_buffer_depth` | Gauge | Payloads waiting in local buffer (backpressure indicator) |
+| Metric                      | Type      | What It Tells You                                         |
+| --------------------------- | --------- | --------------------------------------------------------- |
+| `edge_payloads_sent_total`  | Counter   | Total payloads transmitted to the cloud                   |
+| `edge_acks_received_total`  | Counter   | Total ACKs received (delta with sent = in-flight)         |
+| `edge_retries_total`        | Counter   | Retry count (sustained increase = downstream problem)     |
+| `edge_payload_batch_size`   | Histogram | Distribution of batch sizes (tuning signal)               |
+| `edge_send_latency_seconds` | Histogram | Round-trip time from send to ACK                          |
+| `edge_buffer_depth`         | Gauge     | Payloads waiting in local buffer (backpressure indicator) |
 
 #### L4 Load Balancer (C++)
 
 Exposed via a minimal embedded HTTP handler (or a sidecar exporter if embedding HTTP in the io_uring event loop is undesirable).
 
-| Metric | Type | What It Tells You |
-|---|---|---|
-| `lb_active_connections` | Gauge | Current open TCP connections |
-| `lb_connections_accepted_total` | Counter | Total connections accepted |
-| `lb_connections_failed_total` | Counter | Connections dropped (SYN backlog full, fd exhaustion) |
-| `lb_bytes_forwarded_total` | Counter | Total bytes proxied (throughput proof) |
-| `lb_backend_pool_size` | Gauge | Number of healthy backend pod IPs from DNS |
-| `lb_sqe_submissions_total` | Counter | io_uring submission queue entries submitted |
-| `lb_cqe_completions_total` | Counter | io_uring completion queue entries reaped |
+| Metric                          | Type    | What It Tells You                                     |
+| ------------------------------- | ------- | ----------------------------------------------------- |
+| `lb_active_connections`         | Gauge   | Current open TCP connections                          |
+| `lb_connections_accepted_total` | Counter | Total connections accepted                            |
+| `lb_connections_failed_total`   | Counter | Connections dropped (SYN backlog full, fd exhaustion) |
+| `lb_bytes_forwarded_total`      | Counter | Total bytes proxied (throughput proof)                |
+| `lb_backend_pool_size`          | Gauge   | Number of healthy backend pod IPs from DNS            |
+| `lb_sqe_submissions_total`      | Counter | io_uring submission queue entries submitted           |
+| `lb_cqe_completions_total`      | Counter | io_uring completion queue entries reaped              |
 
 #### Ingestion Pods (Go)
 
 Exposed via the standard `prometheus/client_golang` library. gRPC interceptors automatically capture per-RPC metrics.
 
-| Metric | Type | What It Tells You |
-|---|---|---|
-| `ingester_payloads_received_total` | Counter | Total payloads received from proxy |
-| `ingester_payloads_validated_total` | Counter | Payloads that passed Ed25519 verification |
-| `ingester_payloads_rejected_total` | Counter | Failed signature verification (→ poison queue) |
-| `ingester_auth_latency_seconds` | Histogram | Ed25519 verification time distribution |
-| `ingester_broker_push_latency_seconds` | Histogram | Time to push to broker and receive insertion ACK |
-| `ingester_pool_recycled_total` | Counter | sync.Pool struct reuse count (GC avoidance proof) |
-| `ingester_pool_allocated_total` | Counter | New allocations (should flatline after warmup) |
+| Metric                                       | Type      | What It Tells You                                              |
+| -------------------------------------------- | --------- | -------------------------------------------------------------- |
+| `ingester_payloads_received_total`           | Counter   | Total payloads received from proxy                             |
+| `ingester_payloads_validated_total`          | Counter   | Payloads that passed Ed25519 verification                      |
+| `ingester_payloads_rejected_total`           | Counter   | Failed signature verification (→ poison queue)                 |
+| `ingester_auth_latency_seconds`              | Histogram | Ed25519 verification time distribution                         |
+| `ingester_broker_push_latency_seconds`       | Histogram | Time to push to broker and receive insertion ACK               |
+| `ingester_pool_recycled_total`               | Counter   | sync.Pool struct reuse count (GC avoidance proof)              |
+| `ingester_pool_allocated_total`              | Counter   | New allocations (should flatline after warmup)                 |
+| `ingester_aggregation_window_seconds`        | Gauge     | Current aggregation window (widens under pressure)             |
+| `ingester_aggregation_ratio`                 | Gauge     | Raw payloads in / aggregated payloads out (compression factor) |
+| `ingester_sampling_mode`                     | Gauge     | 0 = normal, 1 = degraded (adaptive sampling active)            |
+| `ingester_payloads_sampled_out_total`        | Counter   | Payloads dropped by adaptive sampling (data resolution lost)   |
+| `ingester_critical_payloads_forwarded_total` | Counter   | CRITICAL payloads forwarded (should never be sampled)          |
 
 #### Message Broker (Rust)
 
 Exposed via the `prometheus` crate. This is the most critical metrics surface — it's where you prove the lock-free design works.
 
-| Metric | Type | What It Tells You |
-|---|---|---|
-| `broker_shard_count` | Gauge | Active SPSC ring buffer shards |
-| `broker_shard_depth` | Gauge (per shard) | Slots occupied per shard (backpressure signal) |
-| `broker_shard_capacity` | Gauge (per shard) | Total slots per shard (depth/capacity = saturation %) |
-| `broker_enqueue_total` | Counter | Total successful enqueues |
-| `broker_dequeue_total` | Counter | Total successful dequeues |
-| `broker_backpressure_events_total` | Counter | Times a producer blocked on a full ring (should be rare) |
-| `broker_poison_queue_depth` | Gauge | Unrecoverable failures awaiting forensic review |
-| `broker_retry_queue_depth` | Gauge | Transient failures awaiting retry |
-| `broker_retry_attempts_total` | Counter | Total retry attempts |
-| `broker_retry_exhausted_total` | Counter | Payloads promoted from retry → poison |
+| Metric                             | Type              | What It Tells You                                     |
+| ---------------------------------- | ----------------- | ----------------------------------------------------- |
+| `broker_shard_count`               | Gauge             | Active SPSC ring buffer shards                        |
+| `broker_shard_depth`               | Gauge (per shard) | Slots occupied per shard (backpressure signal)        |
+| `broker_shard_capacity`            | Gauge (per shard) | Total slots per shard (depth/capacity = saturation %) |
+| `broker_enqueue_total`             | Counter           | Total successful enqueues                             |
+| `broker_dequeue_total`             | Counter           | Total successful dequeues                             |
+| `broker_backpressure_events_total` | Counter           | Times a NORMAL producer blocked on a full ring        |
+| `broker_critical_evictions_total`  | Counter           | NORMAL payloads evicted to make room for CRITICAL     |
+| `broker_critical_enqueue_total`    | Counter           | CRITICAL payloads accepted (should never be rejected) |
+| `broker_poison_queue_depth`        | Gauge             | Unrecoverable failures awaiting forensic review       |
+| `broker_retry_queue_depth`         | Gauge             | Transient failures awaiting retry                     |
+| `broker_retry_attempts_total`      | Counter           | Total retry attempts                                  |
+| `broker_retry_exhausted_total`     | Counter           | Payloads promoted from retry → poison                 |
 
 #### Storage Engine (Go)
 
-| Metric | Type | What It Tells You |
-|---|---|---|
-| `storage_writes_total` | Counter | Total successful SSTable writes |
-| `storage_write_failures_total` | Counter | Failed writes (→ broker retry queue) |
-| `storage_write_latency_seconds` | Histogram | Flush-to-disk latency |
-| `storage_memtable_size_bytes` | Gauge | Current MemTable fill level |
-| `storage_sstable_count` | Gauge | Total SSTables on disk |
-| `storage_compaction_runs_total` | Counter | Compaction cycles completed |
-| `storage_disk_usage_bytes` | Gauge | Total PVC consumption |
+| Metric                          | Type      | What It Tells You                    |
+| ------------------------------- | --------- | ------------------------------------ |
+| `storage_writes_total`          | Counter   | Total successful SSTable writes      |
+| `storage_write_failures_total`  | Counter   | Failed writes (→ broker retry queue) |
+| `storage_write_latency_seconds` | Histogram | Flush-to-disk latency                |
+| `storage_memtable_size_bytes`   | Gauge     | Current MemTable fill level          |
+| `storage_sstable_count`         | Gauge     | Total SSTables on disk               |
+| `storage_compaction_runs_total` | Counter   | Compaction cycles completed          |
+| `storage_disk_usage_bytes`      | Gauge     | Total PVC consumption                |
 
 ### 8.3 Grafana Dashboards
 
@@ -546,15 +615,15 @@ Dashboards are provisioned as JSON files via ConfigMap, loaded automatically on 
 
 **Dashboard 1: Pipeline Overview (the hero dashboard)**
 
-The one-screen summary for a portfolio demo or README screenshot. Top row: four big-number panels showing events/sec ingested, end-to-end p99 latency, active connections, and error rate. Middle row: a throughput time-series graph (stacked area: ingested → queued → written) proving data flows end-to-end. Bottom row: queue saturation gauge (ring buffer depth / capacity) and DLQ counters.
+The one-screen summary for a portfolio demo or README screenshot. Top row: four big-number panels showing events/sec ingested, end-to-end p99 latency, active connections, and error rate. Second row: a throughput time-series graph (stacked area: ingested → queued → written) proving data flows end-to-end. Third row: queue saturation gauge (ring buffer depth / capacity), DLQ counters, and the aggregation compression ratio. Bottom row: flow control status — a traffic-light indicator showing current sampling mode (normal / degraded), the current aggregation window, and the critical eviction rate.
 
 **Dashboard 2: Component Deep Dive**
 
-One row per component. Each row shows that component's key metrics: the LB's connection count and byte throughput, the ingesters' validation rate and pool efficiency, the broker's per-shard depth heatmap, and the storage engine's write latency and disk usage. This is where you demonstrate you understand what to measure and why.
+One row per component. Each row shows that component's key metrics: the LB's connection count and byte throughput, the ingesters' validation rate, pool efficiency, and aggregation ratio, the broker's per-shard depth heatmap with priority breakdown, and the storage engine's write latency and disk usage. This is where you demonstrate you understand what to measure and why.
 
 **Dashboard 3: Alerts and Anomalies**
 
-Panels specifically for failure modes: sustained backpressure events, poison queue growth, retry exhaustion rate, ingester pool allocation spikes (GC pressure returning), and storage write failure bursts. Each panel has a threshold annotation line showing "healthy" vs. "investigate."
+Panels specifically for failure modes: sustained backpressure events, poison queue growth, retry exhaustion rate, ingester pool allocation spikes (GC pressure returning), storage write failure bursts, and adaptive sampling activation history. Each panel has a threshold annotation line showing "healthy" vs. "investigate."
 
 ### 8.4 Alerting Rules (Prometheus Alertmanager)
 
@@ -570,7 +639,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Broker ring buffer full — ingesters are blocking"
+          summary: 'Broker ring buffer full — ingesters are blocking'
 
       - alert: PoisonQueueGrowing
         expr: broker_poison_queue_depth > 100
@@ -578,7 +647,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Poison queue accumulating — possible bad actor or schema mismatch"
+          summary: 'Poison queue accumulating — possible bad actor or schema mismatch'
 
       - alert: RetryExhaustionSpike
         expr: rate(broker_retry_exhausted_total[5m]) > 1
@@ -586,7 +655,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Payloads failing all retry attempts — storage engine may be down"
+          summary: 'Payloads failing all retry attempts — storage engine may be down'
 
       - alert: StorageWriteLatencyHigh
         expr: histogram_quantile(0.99, rate(storage_write_latency_seconds_bucket[5m])) > 0.1
@@ -594,7 +663,23 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Storage p99 write latency above 100ms — disk pressure or compaction lag"
+          summary: 'Storage p99 write latency above 100ms — disk pressure or compaction lag'
+
+      - alert: AdaptiveSamplingActive
+        expr: ingester_sampling_mode == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Ingester in degraded mode — data resolution reduced due to broker pressure'
+
+      - alert: CriticalEvictionSpike
+        expr: rate(broker_critical_evictions_total[5m]) > 10
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Broker evicting NORMAL payloads for CRITICAL — sustained overload'
 ```
 
 ### 8.5 Implementation Notes
